@@ -1,18 +1,22 @@
+# some of the dependencies have deprecated apis and are not maintained, suppress warnings to not interrupt training
 import warnings
 warnings.filterwarnings("ignore")
 
+from transformers import AutoTokenizer, AutoModel
 from lib.naturalspeech3_facodec.ns3_codec import FACodecEncoder2, FACodecDecoder2
 from huggingface_hub import hf_hub_download
 import torchaudio
 import torch
+import torch.nn as nn
 
 
-class FACodec:
+class AudioPromptFACodec(nn.Module):
     """
     FACodec pretrained model from
     https://github.com/lifeiteng/naturalspeech3_facodec.git
     """
     def __init__(self):
+        super().__init__()
         self.fa_encoder = FACodecEncoder2(
             ngf=32,
             up_ratios=[2, 4, 5, 5],
@@ -41,21 +45,32 @@ class FACodec:
         self.fa_encoder.load_state_dict(torch.load(encoder_ckpt, weights_only=True))
         self.fa_decoder.load_state_dict(torch.load(decoder_ckpt, weights_only=True))
 
-        self.fa_encoder.eval()
-        self.fa_decoder.eval()
+        self.fa_encoder.eval().requires_grad_(False)
+        self.fa_decoder.eval().requires_grad_(False)
 
-    def get_latent_Y(self, wav):
+        s
+
+    def convert(self, wav):
         enc = self.fa_encoder(wav)
         vq_pos_emb, vq_id, _, quantized, spk_embs = self.fa_decoder(enc, eval_vq=False, vq=True)
 
         # concat along channel dim (input must be batched)
         style = torch.cat((vq_id[:1], vq_id[3:]), dim=0)
         codec = torch.cat((style, vq_id[1:3]), dim=0)
-        return codec, spk_embs
+        return codec.transpose(0,2), spk_embs
+        # final shape (T (seq_len), B (batch), C (codes)) 
+
+class StyleEncode(nn.Module):
+    def __init__(self, prompt):
+        super().__init__()
+        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+        self.model = AutoModel.from_pretrained('bert-base-uncased')
+
+        self.bert.parameters()
 
 
 def test_audio():
-    fa_codec = FACodec()
+    fa_codec = AudioPromptFACodec()
     wav, sr = torchaudio.load("./test.wav")   # wav: (C, T)
     wav = wav.mean(dim=0, keepdim=True)  # ensure mono (1, T)
 
@@ -64,7 +79,7 @@ def test_audio():
     # Normalization may be required:
     wav = wav / wav.abs().max().clamp(min=1e-8)
 
-    encoded = fa_codec.get_latent_Y(wav)
+    encoded = fa_codec.convert(wav)
     print([e.shape for e in encoded])
 
 if __name__ == "__main__":
