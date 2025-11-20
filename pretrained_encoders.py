@@ -5,10 +5,13 @@ warnings.filterwarnings("ignore")
 from transformers import AutoModel, AutoTokenizer 
 from lib.naturalspeech3_facodec.ns3_codec import FACodecEncoder2, FACodecDecoder2
 from huggingface_hub import hf_hub_download
+
+from phonemizer import phonemize 
 import torchaudio
 import torch
 import torch.nn as nn
-
+import re
+import utils.cleaners
 
 class AudioFACodecEncoder(nn.Module):
     """
@@ -80,6 +83,35 @@ class StyleEncode(nn.Module):
 
         return style # shape is bert embedding (B, 768)
         
+class TextEncode(nn.Module):
+    def __init__(self, embedding_dim=256):
+        self.vocab = self.g2p.phonemes
+        self.embedding = nn.Embedding(len(self.vocab), embedding_dim, padding_idx=0)
+
+    def prepare(self, text):
+
+
+
+        
+    def forward(self, texts):
+        """
+        Args:
+            texts: List[str] or str, single or batch of input texts to encode
+        Returns:
+            Tensor: shape (batch, seq_len, embedding_dim)
+        """
+        if isinstance(texts, str):
+            texts = [texts]
+        phoneme_indices = [self._phonemize(txt) for txt in texts]
+        max_len = max(len(seq) for seq in phoneme_indices)
+        batch_size = len(phoneme_indices)
+        # Pad
+        indices_padded = torch.zeros(batch_size, max_len, dtype=torch.long)
+        for i, seq in enumerate(phoneme_indices):
+            indices_padded[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
+        indices_padded = indices_padded.to(self.embedding.weight.device)
+        phoneme_embeds = self.embedding(indices_padded)
+        return phoneme_embeds  # (batch, seq_len, embedding_dim)
 
 def test_audio():
     fa_codec = AudioFACodecEncoder()
