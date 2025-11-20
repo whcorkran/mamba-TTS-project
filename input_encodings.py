@@ -54,7 +54,7 @@ class FACodec:
         return codec, spk_embs
 
 
-def test():
+def test_audio():
     fa_codec = FACodec()
     wav, sr = torchaudio.load("./test.wav")   # wav: (C, T)
     wav = wav.mean(dim=0, keepdim=True)  # ensure mono (1, T)
@@ -68,4 +68,4 @@ def test():
     print([e.shape for e in encoded])
 
 if __name__ == "__main__":
-    test()
+    test_audio()
