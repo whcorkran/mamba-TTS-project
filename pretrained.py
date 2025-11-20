@@ -2,7 +2,7 @@
 import warnings
 warnings.filterwarnings("ignore")
 
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoModel, AutoTokenizer 
 from lib.naturalspeech3_facodec.ns3_codec import FACodecEncoder2, FACodecDecoder2
 from huggingface_hub import hf_hub_download
 import torchaudio
@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 
-class AudioPromptFACodec(nn.Module):
+class AudioFACodecEncoder(nn.Module):
     """
     FACodec pretrained model from
     https://github.com/lifeiteng/naturalspeech3_facodec.git
@@ -48,9 +48,7 @@ class AudioPromptFACodec(nn.Module):
         self.fa_encoder.eval().requires_grad_(False)
         self.fa_decoder.eval().requires_grad_(False)
 
-        s
-
-    def convert(self, wav):
+    def forward(self, wav):
         enc = self.fa_encoder(wav)
         vq_pos_emb, vq_id, _, quantized, spk_embs = self.fa_decoder(enc, eval_vq=False, vq=True)
 
@@ -66,11 +64,25 @@ class StyleEncode(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
         self.model = AutoModel.from_pretrained('bert-base-uncased')
 
-        self.bert.parameters()
+        for p in self.model.parameters():
+            p.requires_grad = False
 
+    def forward(self, x):
+        tok = self.tokenizer(
+        x,
+        padding=True,
+        truncation=True,
+        return_tensors='pt'
+        ).to(self.model.device)
+
+        out = self.model(**tok)
+        style = out.last_hidden_state[:,0]
+
+        return style # shape is bert embedding (B, 768)
+        
 
 def test_audio():
-    fa_codec = AudioPromptFACodec()
+    fa_codec = AudioFACodecEncoder()
     wav, sr = torchaudio.load("./test.wav")   # wav: (C, T)
     wav = wav.mean(dim=0, keepdim=True)  # ensure mono (1, T)
 
@@ -79,8 +91,19 @@ def test_audio():
     # Normalization may be required:
     wav = wav / wav.abs().max().clamp(min=1e-8)
 
-    encoded = fa_codec.convert(wav)
+    encoded = fa_codec(wav)
     print([e.shape for e in encoded])
 
+def test_text():
+    # Create example texts
+    texts = ["This is a test sentence.", "Another style input."]
+    # Construct StyleEncode instance
+    style_encoder = StyleEncode(prompt=None)
+    # Forward pass
+    with torch.no_grad():
+        style_embeds = style_encoder(texts)
+    print(f"Style embeddings shape: {style_embeds.shape}")
+    print("Sample embedding:", style_embeds[0, :5])
+
 if __name__ == "__main__":
-    test_audio()
+    test_text()
