@@ -7,13 +7,11 @@ from transformers import AutoModel, AutoTokenizer
 from lib.naturalspeech3_facodec.ns3_codec import FACodecEncoder2, FACodecDecoder2
 from huggingface_hub import hf_hub_download
 
-from phonemizer import phonemize
-from utils.cleaners import english_cleaners
+
+from preprocess import preprocess_text, text_to_phoneme
 import torchaudio
 import torch
 import torch.nn as nn
-import re
-import utils.cleaners
 
 
 class AudioFACodecEncoder(nn.Module):
@@ -59,20 +57,33 @@ class AudioFACodecEncoder(nn.Module):
         self.fa_encoder.eval().requires_grad_(False)
         self.fa_decoder.eval().requires_grad_(False)
 
-    def forward(self, wav):
+    def encode(self, wav : str | list[str]):
+        # FACodec expects (B, 1, T) or (B, T). We keep (B, 1, T).
+        wav = wav  # leave audio unchanged
         enc = self.fa_encoder(wav)
         vq_pos_emb, vq_id, _, quantized, spk_embs = self.fa_decoder(
             enc, eval_vq=False, vq=True
         )
+        # FACodec ordering:
+        # vq_id shape: (num_quantizers, B, T)
+        # Qc = content, Qp = prosody, Qr = 3 residual/acoustic levels
+        Qc = vq_id[0:1]       # (1, B, T)
+        Qp = vq_id[1:2]       # (1, B, T)
+        Qr = vq_id[2:]        # (3, B, T)
 
-        # concat along channel dim (input must be batched)
-        style = torch.cat((vq_id[:1], vq_id[3:]), dim=0)
-        codec = torch.cat((style, vq_id[1:3]), dim=0)
-        return codec.transpose(0, 2), spk_embs
+        # Style codec = prosody + residuals
+        Ys = torch.cat((Qp, Qr), dim=0)  # (4, B, T)
+        Yc = Qc                          # (1, B, T)
+
+        # ControlSpeech expects concat(Ys, Yc) along quantizer dimension
+        codec = torch.cat((Ys, Yc), dim=0)  # (5, B, T)
+
+        # Return (T, B, C)
+        return codec.permute(2, 1, 0), spk_embs
         # final shape (T (seq_len), B (batch), C (codes))
 
 
-class StyleEncode(nn.Module):
+class StyleBERTEncoder(nn.Module):
     def __init__(self, prompt):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
@@ -92,32 +103,6 @@ class StyleEncode(nn.Module):
         return style  # shape is bert embedding (B, 768)
 
 
-class TextEncode(nn.Module):
-    def __init__(self, embedding_dim=256):
-        self.vocab = self.g2p.phonemes
-        self.embedding = nn.Embedding(len(self.vocab), embedding_dim, padding_idx=0)
-
-    def forward(self, texts):
-        """
-        Args:
-            texts: List[str] or str, single or batch of input texts to encode
-        Returns:
-            Tensor: shape (batch, seq_len, embedding_dim)
-        """
-        if isinstance(texts, str):
-            texts = [texts]
-        phoneme_indices = [self._phonemize(txt) for txt in texts]
-        max_len = max(len(seq) for seq in phoneme_indices)
-        batch_size = len(phoneme_indices)
-        # Pad
-        indices_padded = torch.zeros(batch_size, max_len, dtype=torch.long)
-        for i, seq in enumerate(phoneme_indices):
-            indices_padded[i, : len(seq)] = torch.tensor(seq, dtype=torch.long)
-        indices_padded = indices_padded.to(self.embedding.weight.device)
-        phoneme_embeds = self.embedding(indices_padded)
-        return phoneme_embeds  # (batch, seq_len, embedding_dim)
-
-
 def test_audio():
     fa_codec = AudioFACodecEncoder()
     wav, sr = torchaudio.load("./test.wav")  # wav: (C, T)
@@ -125,8 +110,8 @@ def test_audio():
 
     wav = wav.unsqueeze(0)  # (1, 1, T)
 
-    # Normalization may be required:
-    wav = wav / wav.abs().max().clamp(min=1e-8)
+    # FACodec should receive raw [-1,1] waveform without per-sample normalization
+    wav = wav
 
     encoded = fa_codec(wav)
     print([e.shape for e in encoded])
@@ -136,7 +121,7 @@ def test_text():
     # Create example texts
     texts = ["This is a test sentence.", "Another style input."]
     # Construct StyleEncode instance
-    style_encoder = StyleEncode(prompt=None)
+    style_encoder = StyleBERTEncoder(prompt=None)
     # Forward pass
     with torch.no_grad():
         style_embeds = style_encoder(texts)
@@ -146,4 +131,4 @@ def test_text():
 
 if __name__ == "__main__":
     test_text()
-
+    test_audio()
