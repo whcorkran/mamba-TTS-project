@@ -1,11 +1,12 @@
 # lib generated with setup.sh
 lib
-
+VccmDataset
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
 *$py.class
+.DS_store
 
 # C extensions
 *.so
@@ -203,6 +204,7 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+CLAUDE.md
 
 # Marimo
 marimo/_static/

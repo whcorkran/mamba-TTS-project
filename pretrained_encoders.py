@@ -78,9 +78,9 @@ class AudioFACodecEncoder(nn.Module):
         # ControlSpeech expects concat(Ys, Yc) along quantizer dimension
         codec = torch.cat((Ys, Yc), dim=0)  # (5, B, T)
 
-        # Return (T, B, C)
-        return codec.permute(2, 1, 0), spk_embs
-        # final shape (T (seq_len), B (batch), C (codes))
+        # Return (B, T, C)
+        return codec.permute(1, 2, 0), spk_embs
+        # final shape (B (batch), T (seq_len), C (codes))
 
 
 class StyleBERTEncoder(nn.Module):
