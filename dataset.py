@@ -3,11 +3,9 @@ Dataset wrapper for VccmDataset/controlspeech_train.csv
 Retrieves text prompts, style prompts, and audio samples for TTS training.
 """
 
-import os
 import io
 from pathlib import Path
 import csv
-from typing import Dict, Optional, List
 import torch
 import random
 from torch.utils.data import Dataset
@@ -42,7 +40,6 @@ class VccmTTSDataset(Dataset):
         csv_path: str = "VccmDataset/controlspeech_train.csv",
         audio_root: str = "TextrolSpeech_data.tar.gz",
         sample_rate: int = 16000,
-        limit: Optional[int] = None,
     ):
         """
         Initialize dataset.
@@ -69,7 +66,7 @@ class VccmTTSDataset(Dataset):
 
         self.audio_cursor = {m.name : m for m in self.tar_audio.getmembers() if m.isfile() and m.name.endswith(".wav")}
 
-    def _waveform(self, item_name):
+    def _wav_to_tensor(self, item_name):
         audio_path = Path(item_name.replace("-", "/")).with_suffix(".wav")
         audio_path = self.audio_cursor[str(audio_path)]
         wav = self.tar_audio.extractfile(audio_path)
@@ -91,14 +88,25 @@ class VccmTTSDataset(Dataset):
         speaker_examples = self.speaker_map[sample['spk']]
         speaker_name = random.choice(list(filter(lambda x: x != item_name, speaker_examples)))
 
-        speaker_waveform = self._waveform(speaker_name)
-        target_waveform = self._waveform(item_name)
+        speaker_waveform = self._wav_to_tensor(speaker_name)
+        target_waveform = self._wav_to_tensor(item_name)
 
         return {
             'voice_waveform': speaker_waveform,
             'text_prompt': sample['txt'],
             'style_prompt': sample['style_prompt'],
         }, target_waveform
+
+    def collate_fn(self, batch):
+        voices = [item[0]['voice_waveform'] for item in batch]
+        texts = [item[0]['text_prompt'] for item in batch]
+        styles = [item[0]['style_prompt'] for item in batch]
+        targets = [item[1] for item in batch]
+        return {
+            'voice_waveform': torch.stack(voices),
+            'text_prompt': texts,
+            'style_prompt': styles,
+        }, torch.stack(targets)
 
 if __name__ == "__main__":
     # Test the dataset with proper validation
