@@ -2,7 +2,7 @@
 lib
 # data and big files downloaded
 VccmDataset
-debug_set
+processed_data
 *.tar.gz
 *.wav
 

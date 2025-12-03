@@ -15,8 +15,8 @@ import numpy as np
 import pyloudnorm as pyln
 from scipy.io import wavfile
 import torch
+import torchaudio
 
-from transformers import AutoModel, AutoTokenizer
 from lib.naturalspeech3_facodec.ns3_codec import FACodecEncoder2, FACodecDecoder2
 from huggingface_hub import hf_hub_download
 
@@ -118,7 +118,7 @@ class FACodecEncoder:
 
     def __init__(self, max_seq_len: int = 1024):
         super().__init__()
-        self.sequence_length = max_seq_len,
+        self.max_seq_len = max_seq_len
         self.fa_encoder = FACodecEncoder2(
             ngf=32,
             up_ratios=[2, 4, 5, 5],
@@ -154,9 +154,43 @@ class FACodecEncoder:
         self.fa_encoder.eval().requires_grad_(False)
         self.fa_decoder.eval().requires_grad_(False)
 
-    def encode(self, wav : str | list[str]):
-        # FACodec expects (B, 1, T) or (B, T). We keep (B, 1, T).
-        enc = self.fa_encoder(wav)
+    def encode(self, wav: str | bytes | list[str | bytes], sr: int = 16000):
+        """Encode audio file(s) to FACodec tokens.
+        
+        Args:
+            wav: Path(s) to audio file(s), or raw bytes from audio file(s)
+            sr: Target sample rate
+        """
+        import io
+        import soundfile as sf
+        
+        # Normalize to list
+        if isinstance(wav, (str, bytes)):
+            wav = [wav]
+        
+        audio_tensors = []
+        for item in wav:
+            if isinstance(item, bytes):
+                # Load from bytes
+                audio_data, orig_sr = sf.read(io.BytesIO(item))
+                audio = torch.from_numpy(audio_data).float()
+                if audio.ndim == 2:  # stereo -> mono
+                    audio = audio.mean(dim=1)
+            else:
+                # Load from file path
+                audio, orig_sr = torchaudio.load(item)
+                audio = audio.squeeze(0).float()  # (1, T) -> (T,)
+            
+            if orig_sr != sr:
+                audio = torchaudio.functional.resample(audio.unsqueeze(0), orig_sr, sr).squeeze(0)
+            audio_tensors.append(audio)
+        
+        # Pad to same length and stack
+        max_len = max(t.shape[0] for t in audio_tensors)
+        padded = [torch.nn.functional.pad(t, (0, max_len - t.shape[0])) for t in audio_tensors]
+        audio_batch = torch.stack(padded, dim=0).unsqueeze(1)  # (B, 1, T)
+        
+        enc = self.fa_encoder(audio_batch)
         vq_pos_emb, vq_id, _, quantized, spk_embs = self.fa_decoder(
             enc, eval_vq=False, vq=True
         )
@@ -169,12 +203,18 @@ class FACodecEncoder:
 
         # pad or truncate to max_seq_len
         # as per paper, each token corresponds to 12.5ms of audio
-        # default max_seq is 1600, which corresponds to 20 seconds of audio
-        for q in [Qc, Qp, Qr]:
+        # default max_seq is 1024, which corresponds to ~12.8 seconds of audio
+        def pad_or_truncate(q):
             if q.shape[2] > self.max_seq_len:
-                q = q[:, :, :self.max_seq_len]
+                return q[:, :, :self.max_seq_len]
             elif q.shape[2] < self.max_seq_len:
-                q = torch.cat([q, torch.zeros(1, q.shape[1], self.max_seq_len - q.shape[2])], dim=2)
+                pad_len = self.max_seq_len - q.shape[2]
+                return torch.cat([q, torch.zeros(q.shape[0], q.shape[1], pad_len, device=q.device)], dim=2)
+            return q
+        
+        Qc = pad_or_truncate(Qc)
+        Qp = pad_or_truncate(Qp)
+        Qr = pad_or_truncate(Qr)
 
         # Style codec = prosody + residuals
         Ys = torch.cat((Qp, Qr), dim=0)  # (4, B, T)
@@ -188,7 +228,7 @@ class FACodecEncoder:
         # final shape (B (batch), T (seq_len), C (codes))
 
 class AudioEncoder(BaseAudioPreprocessor):
-    def __init__(self, dataset ,encoder: FACodecEncoder):
+    def __init__(self, dataset, encoder: FACodecEncoder):
         super().__init__()
         self.codec = encoder
         self.dataset = dataset
@@ -199,8 +239,8 @@ class AudioEncoder(BaseAudioPreprocessor):
         if isinstance(wav, str):
             wav = [wav]
 
-        encoded = [self.codec.encode(wav) for w in wav]
-        torch.stack(encoded, dim=0)
+        encoded = [self.codec.encode(w)[0] for w in wav]  # [0] gets codec, not spk_emb
+        return torch.stack(encoded, dim=0)
  
 if __name__ == '__main__':
     

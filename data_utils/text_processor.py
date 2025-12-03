@@ -285,11 +285,11 @@ class BertModel:
 
         return style  # shape is bert embedding (B, 768)
 
-class StyleProcessor(BaseTextProcessor):
+class StyleProcessor(TxtProcessor):
     def __init__(self, model: BertModel):
         super().__init__()
         self.model = model
 
     def embed(self, x):
         x = self.preprocess_text(x)
-        return self.model(x)
+        return self.model.forward(x)
