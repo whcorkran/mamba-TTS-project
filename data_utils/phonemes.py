@@ -7,7 +7,7 @@ import json
 import argparse
 from tqdm import tqdm
 
-from data_utils.text_processor import TxtProcessor
+from .text_processor import TxtProcessor
 
 
 SPECIAL_TOKENS = ["<PAD>", "<BOS>", "<EOS>", "|", "!", ",", ".", ":", ";", "?"]

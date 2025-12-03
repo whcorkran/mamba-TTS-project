@@ -3,7 +3,6 @@ Dataset preprocessing pipeline.
 Preprocesses CSV dataset: audio encoding, text-to-phoneme, style embeddings.
 Saves processed data for PyTorch DataLoader.
 """
-import io
 import csv
 import json
 import tarfile
@@ -11,15 +10,11 @@ import argparse
 from pathlib import Path
 from typing import Optional, Dict, List, Union, Tuple
 
-import librosa
 import torch
-import torchaudio
-import numpy as np
 from tqdm import tqdm
 
 from .text_processor import TxtProcessor, BertModel, StyleProcessor
 from .audio_encoder import FACodecEncoder, BaseAudioPreprocessor
-from .phonemes import SPECIAL_TOKENS
 
 
 class DatasetPreprocessor:
@@ -29,8 +24,10 @@ class DatasetPreprocessor:
         self,
         output_dir: str,
         tarball_paths: Union[str, List[str]],
+        phoneme_vocab_path: str,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         sample_rate: int = 16000,
+        debug: bool = False,
     ):
         """
         Initialize preprocessor.
@@ -39,13 +36,23 @@ class DatasetPreprocessor:
             output_dir: Directory to save preprocessed data
             tarball_paths: Path(s) to tarball(s) containing audio files.
                            Can be a single path, a list of paths, or comma-separated paths.
+            phoneme_vocab_path: Path to phoneme vocabulary JSON file
             device: Device for model inference
             sample_rate: Target sample rate for audio
+            debug: If True, only process first 128 samples
         """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.device = device
         self.sample_rate = sample_rate
+        self.debug = debug
+        
+        # Load phoneme vocabulary
+        print(f"Loading phoneme vocabulary: {phoneme_vocab_path}")
+        with open(phoneme_vocab_path, 'r', encoding='utf-8') as f:
+            self.phoneme_vocab: List[str] = json.load(f)
+        self.phoneme_to_idx: Dict[str, int] = {p: i for i, p in enumerate(self.phoneme_vocab)}
+        print(f"  Loaded {len(self.phoneme_vocab)} phonemes")
         
         # Normalize tarball_paths to a list
         if isinstance(tarball_paths, str):
@@ -81,9 +88,6 @@ class DatasetPreprocessor:
         
         self.audio_encoder = FACodecEncoder()
         self.audio_preprocessor = BaseAudioPreprocessor(sample_rate=sample_rate)
-        
-        # Phoneme vocabulary (accumulated during processing)
-        self.phoneme_set = set()
     
     def __del__(self):
         """Close all tarballs on cleanup."""
@@ -103,29 +107,39 @@ class DatasetPreprocessor:
         """Convert text to phonemes using TxtProcessor."""
         ph, txt, word, ph2word, ph_gb_word = self.txt_processor.txt_to_ph(text)
         phonemes = ph.split()
-        self.phoneme_set.update(phonemes)
+        
+        # Convert phonemes to integer indices
+        phoneme_ids = []
+        for p in phonemes:
+            if p in self.phoneme_to_idx:
+                phoneme_ids.append(self.phoneme_to_idx[p])
+            else:
+                # Unknown phoneme - use <PAD> (index 0) as fallback
+                print(f"  Warning: Unknown phoneme '{p}', using <PAD>")
+                phoneme_ids.append(0)
         
         return {
             'phonemes': phonemes,
+            'phoneme_ids': torch.tensor(phoneme_ids, dtype=torch.long),
             'phoneme_str': ph,
             'cleaned_text': txt,
             'words': word.split(),
             'ph2word': ph2word,
         }
     
-    def process_style(self, style_prompt: str) -> np.ndarray:
+    def process_style(self, style_prompt: str) -> torch.Tensor:
         """Embed style prompt using BERT."""
         with torch.no_grad():
             style_emb = self.style_processor.embed(style_prompt)
-        return style_emb.cpu().numpy()
+        return style_emb.cpu()
     
-    def process_audio(self, wav_path: str) -> np.ndarray:
+    def process_audio(self, wav_path: str) -> torch.Tensor:
         try:
             # Encode with FACodec
             with torch.no_grad():
                 codec, spk_emb = self.audio_encoder.encode(wav_path)
             
-            return codec.cpu().numpy()
+            return codec.cpu()
     
         except Exception as e:
             print(f"  Audio encoding error: {e}")
@@ -149,6 +163,7 @@ class DatasetPreprocessor:
             'item_name': item_name,
             'text': row['txt'],
             'phonemes': text_data['phonemes'],
+            'phoneme_ids': text_data['phoneme_ids'],
             'phoneme_str': text_data['phoneme_str'],
             'ph2word': text_data['ph2word'],
             'style_emb': style_emb,
@@ -184,7 +199,7 @@ class DatasetPreprocessor:
         skipped = 0
         errors = 0
         
-        for row in tqdm(rows, desc="Processing"):
+        for row in tqdm(rows[:128] if self.debug else rows, desc="Processing"):
             try:
                 item = self.process_row(row)
                 if item is not None:
@@ -209,22 +224,37 @@ class DatasetPreprocessor:
         return processed
     
     def save_processed(self, processed: list):
+        """
+        Save processed data in DataLoader-friendly format as PyTorch tensors.
+        
+        Directory structure:
+            output_dir/
+            ├── metadata.json          # Sample index with text metadata
+            ├── style_embeddings/      # BERT style embeddings
+            │   └── {item_name}.pt
+            ├── phoneme_ids/           # Phoneme integer sequences
+            │   └── {item_name}.pt
+            └── audio_codecs/          # FACodec audio tensors
+                └── {item_name}.pt
+        """
         print(f"\nSaving to {self.output_dir}")
-
-        # Reuse phoneme vocabulary logic from phonemes.py
-        vocab = SPECIAL_TOKENS.copy()
-        vocab.extend(sorted(p for p in self.phoneme_set if p not in SPECIAL_TOKENS))
-
-        vocab_path = self.output_dir / "phoneme_vocab.json"
-        with open(vocab_path, 'w', encoding='utf-8') as f:
-            json.dump(vocab, f, indent=2)
-        print(f"  Saved vocabulary ({len(vocab)}) to {vocab_path}")
+        
+        # Create subdirectories for each tensor type
+        style_dir = self.output_dir / "style_embeddings"
+        phoneme_dir = self.output_dir / "phoneme_ids"
+        audio_dir = self.output_dir / "audio_codecs"
+        
+        style_dir.mkdir(exist_ok=True)
+        phoneme_dir.mkdir(exist_ok=True)
+        audio_dir.mkdir(exist_ok=True)
         
         # Save metadata (JSON-serializable parts)
         metadata = []
         for item in processed:
+            item_name = item['item_name'].replace('/', '_').replace(' ', '_')
             meta = {
                 'item_name': item['item_name'],
+                'file_key': item_name,  # Sanitized name for file lookups
                 'text': item['text'],
                 'phonemes': item['phonemes'],
                 'phoneme_str': item['phoneme_str'],
@@ -244,32 +274,36 @@ class DatasetPreprocessor:
             json.dump(metadata, f, indent=2)
         print(f"  Saved metadata ({len(metadata)} items) to {meta_path}")
         
-        # Save tensors
-        tensors_dir = self.output_dir / "tensors"
-        tensors_dir.mkdir(exist_ok=True)
-        
+        # Save tensors organized by type
         for item in tqdm(processed, desc="Saving tensors"):
             item_name = item['item_name'].replace('/', '_').replace(' ', '_')
-            style_path = tensors_dir / f"{item_name}_style.npy"
-            np.save(style_path, item['style_emb'])
             
-            if item.get('audio') and item['audio'].get('codec') is not None:
-                codec_path = tensors_dir / f"{item_name}_codec.npy"
-                np.save(codec_path, item['audio']['codec'])
-                
-                if item['audio'].get('spk_emb') is not None:
-                    spk_path = tensors_dir / f"{item_name}_spk.npy"
-                    np.save(spk_path, item['audio']['spk_emb'])
+            # Save style embeddings
+            style_path = style_dir / f"{item_name}.pt"
+            torch.save(item['style_emb'], style_path)
+            
+            # Save phoneme IDs
+            phoneme_path = phoneme_dir / f"{item_name}.pt"
+            torch.save(item['phoneme_ids'], phoneme_path)
+            
+            # Save audio codecs
+            if item.get('audio') is not None:
+                audio_path = audio_dir / f"{item_name}.pt"
+                torch.save(item['audio'], audio_path)
         
-        print("  Saved tensors to", tensors_dir)
+        print(f"  Saved style embeddings to {style_dir}")
+        print(f"  Saved phoneme IDs to {phoneme_dir}")
+        print(f"  Saved audio codecs to {audio_dir}")
 
 
 def preprocess_dataset(
     csv_path: str,
     output_dir: str,
     tarball_paths: Union[str, List[str]],
+    phoneme_vocab_path: str,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     sample_rate: int = 16000,
+    debug: bool = False,
 ):
     """
     Convenience function to preprocess dataset.
@@ -279,8 +313,10 @@ def preprocess_dataset(
         output_dir: Directory to save preprocessed data
         tarball_paths: Path(s) to tarball(s) containing audio files.
                        Can be a single path, a list of paths, or comma-separated paths.
+        phoneme_vocab_path: Path to phoneme vocabulary JSON file
         device: Device for model inference
         sample_rate: Target sample rate for audio
+        debug: If True, only process first 128 samples
         
     Returns:
         List of processed items
@@ -288,8 +324,10 @@ def preprocess_dataset(
     preprocessor = DatasetPreprocessor(
         output_dir=output_dir,
         tarball_paths=tarball_paths,
+        phoneme_vocab_path=phoneme_vocab_path,
         device=device,
         sample_rate=sample_rate,
+        debug=debug,
     )
     return preprocessor.preprocess(csv_path)
 
@@ -304,11 +342,14 @@ if __name__ == '__main__':
                         help="Path(s) to audio tarball(s). Can specify multiple: "
                              "--tarball file1.tar file2.tar or use comma-separated: "
                              "--tarball 'file1.tar,file2.tar'")
+    parser.add_argument("--phoneme_vocab", type=str, required=True,
+                        help="Path to phoneme vocabulary JSON file")
     parser.add_argument("--sample_rate", type=int, default=16000,
                         help="Target sample rate (default: 16000)")
     parser.add_argument("--device", type=str, default=None,
                         help="Device for inference (default: cuda if available)")
-    
+    parser.add_argument("--debug", action='store_true', default=False,
+                        help="Use debug dataset (process only first 128 samples)")
     args = parser.parse_args()
     
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -322,6 +363,8 @@ if __name__ == '__main__':
         csv_path=args.csv_path,
         output_dir=args.output_dir,
         tarball_paths=tarball_paths,
+        phoneme_vocab_path=args.phoneme_vocab,
         device=device,
         sample_rate=args.sample_rate,
+        debug=args.debug,
     )

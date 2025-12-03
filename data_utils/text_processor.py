@@ -10,6 +10,10 @@ from g2p_en.expand import normalize_numbers
 from nltk import pos_tag
 from nltk.tokenize import TweetTokenizer
 
+from transformers import AutoTokenizer, AutoModel
+
+# Phoneme Processing
+
 # Constants
 PUNCS = '!,.?;:'
 
@@ -260,9 +264,9 @@ class TxtProcessor(BaseTextProcessor):
         return " ".join(ph), txt, " ".join(words), ph2word, " ".join(ph_gb_word)
 
 
-# Style Tokens
+# Style Embeddings
 
-class BertEmbedder:
+class BertModel:
     def __init__(self):
         tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
         model = AutoModel.from_pretrained("bert-base-uncased")
@@ -272,8 +276,20 @@ class BertEmbedder:
         self.model = model
 
     def forward(self, x):
-        return self.model(x)
+        tok = self.tokenizer(x, padding=True, truncation=True, return_tensors="pt").to(
+            self.model.device
+        )
 
-class StyleProcessor():
-    def __init__(self):
+        out = self.model(**tok)
+        style = out.last_hidden_state[:, 0]
+
+        return style  # shape is bert embedding (B, 768)
+
+class StyleProcessor(BaseTextProcessor):
+    def __init__(self, model: BertModel):
         super().__init__()
+        self.model = model
+
+    def embed(self, x):
+        x = self.preprocess_text(x)
+        return self.model(x)
