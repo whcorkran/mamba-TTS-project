@@ -4,6 +4,15 @@ Text to phoneme preprocessing logic recreated from ControlSpeech/baseline/prompt
 import re
 import unicodedata
 from typing import List, Tuple
+import torch
+
+# Download required NLTK resources (only downloads if not present)
+import nltk
+nltk.download('averaged_perceptron_tagger_eng', quiet=True)
+nltk.download('averaged_perceptron_tagger', quiet=True)
+nltk.download('cmudict', quiet=True)
+nltk.download('punkt', quiet=True)
+nltk.download('punkt_tab', quiet=True)
 
 from g2p_en import G2p
 from g2p_en.expand import normalize_numbers
@@ -267,20 +276,23 @@ class TxtProcessor(BaseTextProcessor):
 # Style Embeddings
 
 class BertModel:
-    def __init__(self):
+    def __init__(self, device: str = None):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
         model = AutoModel.from_pretrained("bert-base-uncased")
         for p in model.parameters():
             p.requires_grad = False
         self.tokenizer = tokenizer
-        self.model = model
+        self.model = model.to(self.device)
+        self.model.eval()
 
     def forward(self, x):
         tok = self.tokenizer(x, padding=True, truncation=True, return_tensors="pt").to(
-            self.model.device
+            self.device
         )
 
-        out = self.model(**tok)
+        with torch.no_grad():
+            out = self.model(**tok)
         style = out.last_hidden_state[:, 0]
 
         return style  # shape is bert embedding (B, 768)
