@@ -14,11 +14,8 @@ import csv
 import json
 import tarfile
 import argparse
-import threading
 from pathlib import Path
-from queue import Queue
 from typing import Optional, Dict, List, Union, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
 import numpy as np
@@ -199,27 +196,19 @@ class DatasetPreprocessor:
             'audio': audio_data,
         }
     
-    def preprocess(self, csv_path: str, flush_every: int = 100, num_workers: int = 4):
+    def preprocess(self, csv_path: str, flush_every: int = 100):
         """
-        Preprocess entire dataset from CSV with concurrency.
-        
-        Uses parallel workers for:
-        - Text processing (G2P conversion) - CPU bound
-        - Audio extraction from tarball - I/O bound
-        - Background disk writes - I/O bound
-        
-        GPU operations (BERT, FACodec) remain sequential.
+        Preprocess entire dataset from CSV.
+        Writes to disk every `flush_every` samples to avoid OOM.
         
         Args:
             csv_path: Path to CSV file
             flush_every: Number of samples to buffer before writing to disk
-            num_workers: Number of worker threads for parallel processing
             
         Returns:
             Total number of processed items
         """
         print(f"\nPreprocessing dataset from {csv_path}")
-        print(f"Using {num_workers} workers for parallel processing")
         
         # Read CSV
         with open(csv_path, 'r', encoding='utf-8') as f:
@@ -230,87 +219,39 @@ class DatasetPreprocessor:
         tensors_dir = self.output_dir / "tensors"
         tensors_dir.mkdir(exist_ok=True)
         
-        rows_to_process = rows[:10] if self.debug else rows
-        
-        # Setup background writer
-        write_queue: Queue = Queue()
-        all_metadata: List[dict] = []
-        metadata_lock = threading.Lock()
-        
-        def background_writer():
-            """Background thread that writes tensors to disk."""
-            while True:
-                item = write_queue.get()
-                if item is None:  # Poison pill
-                    break
-                self._write_item(item, tensors_dir, all_metadata, metadata_lock)
-                write_queue.task_done()
-        
-        writer_thread = threading.Thread(target=background_writer, daemon=True)
-        writer_thread.start()
-        
-        # Process in batches with parallel text/audio prep
+        # Process each row, flushing to disk periodically
+        buffer = []
+        all_metadata = []
         skipped = 0
         errors = 0
         total_processed = 0
         
-        # Process rows in chunks to enable parallel pre-processing
-        chunk_size = flush_every
+        rows_to_process = rows[:10] if self.debug else rows
         
-        for chunk_start in tqdm(range(0, len(rows_to_process), chunk_size), desc="Chunks"):
-            chunk = rows_to_process[chunk_start:chunk_start + chunk_size]
-            
-            # Phase 1: Parallel text processing and audio extraction (CPU/IO bound)
-            prepared = self._prepare_batch_parallel(chunk, num_workers)
-            
-            # Phase 2: Sequential GPU processing (BERT + FACodec)
-            for prep in prepared:
-                if prep is None:
-                    skipped += 1
-                    continue
-                    
-                try:
-                    # GPU operations (sequential)
-                    style_emb = self.process_style(prep['style_prompt'])
-                    audio_data = self._encode_audio_bytes(prep['audio_bytes'])
-                    
-                    if audio_data is None:
-                        skipped += 1
-                        continue
-                    
-                    # Build final item and queue for writing
-                    item = {
-                        'item_name': prep['item_name'],
-                        'text': prep['text'],
-                        'phonemes': prep['text_data']['phonemes'],
-                        'phoneme_ids': prep['text_data']['phoneme_ids'],
-                        'phoneme_str': prep['text_data']['phoneme_str'],
-                        'ph2word': prep['text_data']['ph2word'],
-                        'style_emb': style_emb,
-                        'style_prompt': prep['style_prompt'],
-                        'emotion': prep.get('emotion', ''),
-                        'gender': prep.get('gender', ''),
-                        'speaker': prep.get('speaker', ''),
-                        'dur_label': prep.get('dur_label', ''),
-                        'pitch_label': prep.get('pitch_label', ''),
-                        'energy_label': prep.get('energy_label', ''),
-                        'audio': audio_data,
-                    }
-                    
-                    write_queue.put(item)
+        for row in tqdm(rows_to_process, desc="Processing"):
+            try:
+                item = self.process_row(row)
+                if item is not None:
+                    buffer.append(item)
                     total_processed += 1
                     
-                except Exception as e:
-                    errors += 1
-                    if errors <= 5:
-                        print(f"\nError processing {prep.get('item_name', 'unknown')}: {e}")
+                    # Flush buffer to disk when full
+                    if len(buffer) >= flush_every:
+                        self._flush_buffer(buffer, tensors_dir, all_metadata)
+                        buffer.clear()
+                else:
+                    skipped += 1
+            except Exception as e:
+                errors += 1
+                if errors <= 5:
+                    print(f"\nError processing {row.get('item_name', 'unknown')}: {e}")
         
-        # Wait for all writes to complete
-        write_queue.join()
-        write_queue.put(None)  # Poison pill to stop writer
-        writer_thread.join()
+        # Flush any remaining items
+        if buffer:
+            self._flush_buffer(buffer, tensors_dir, all_metadata)
+            buffer.clear()
         
-        # Save metadata
+        # Save metadata (accumulated throughout processing)
         meta_path = self.output_dir / "metadata.json"
         with open(meta_path, 'w') as f:
             json.dump(all_metadata, f, indent=2)
@@ -318,7 +259,7 @@ class DatasetPreprocessor:
         print("\n" + "="*50)
         print("Preprocessing complete:")
         print(f"  Processed: {total_processed}")
-        print(f"  Skipped: {skipped}")
+        print(f"  Skipped (audio not found): {skipped}")
         print(f"  Errors: {errors}")
         print(f"  Total rows: {len(rows_to_process)}")
         print(f"  Saved metadata to {meta_path}")
@@ -327,87 +268,25 @@ class DatasetPreprocessor:
         
         return total_processed
     
-    def _prepare_row(self, row: dict) -> Optional[dict]:
-        """Prepare a single row (text processing + audio extraction). Thread-safe."""
-        try:
-            item_name = row['item_name']
-            audio_path = self.item_name_to_path(item_name)
+    def _flush_buffer(self, buffer: list, tensors_dir: Path, all_metadata: list):
+        """Write buffered items to disk and accumulate metadata."""
+        for item in buffer:
+            item_name = item['item_name'].replace('/', '_').replace(' ', '_')
             
-            # Extract audio bytes from tarball
-            if audio_path not in self.audio_index:
-                return None
-            tar, member = self.audio_index[audio_path]
-            f = tar.extractfile(member)
-            if f is None:
-                return None
-            audio_bytes = f.read()
+            # Save phoneme ids as integer tensor
+            phoneme_ids_tensor = torch.tensor(item['phoneme_ids'], dtype=torch.long)
+            torch.save(phoneme_ids_tensor, tensors_dir / f"{item_name}_phonemes.pt")
             
-            # Text processing (CPU bound, thread-safe)
-            text_data = self.process_text(row['txt'])
+            # Save style embedding
+            style_tensor = torch.from_numpy(item['style_emb']) if isinstance(item['style_emb'], np.ndarray) else item['style_emb']
+            torch.save(style_tensor, tensors_dir / f"{item_name}_style.pt")
             
-            return {
-                'item_name': item_name,
-                'text': row['txt'],
-                'text_data': text_data,
-                'style_prompt': row['style_prompt'],
-                'audio_bytes': audio_bytes,
-                'emotion': row.get('emotion', ''),
-                'gender': row.get('gender', ''),
-                'speaker': row.get('spk', ''),
-                'dur_label': row.get('dur', ''),
-                'pitch_label': row.get('pitch', ''),
-                'energy_label': row.get('energy', ''),
-            }
-        except Exception:
-            return None
-    
-    def _prepare_batch_parallel(self, rows: list, num_workers: int) -> list:
-        """Prepare a batch of rows in parallel (text + audio extraction)."""
-        results = [None] * len(rows)
-        
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            future_to_idx = {
-                executor.submit(self._prepare_row, row): idx 
-                for idx, row in enumerate(rows)
-            }
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                try:
-                    results[idx] = future.result()
-                except Exception:
-                    results[idx] = None
-        
-        return results
-    
-    def _encode_audio_bytes(self, audio_bytes: bytes) -> Optional[np.ndarray]:
-        """Encode audio bytes with FACodec."""
-        try:
-            with torch.no_grad():
-                codec, _ = self.audio_encoder.encode(audio_bytes)
-            return codec.cpu().numpy()
-        except Exception as e:
-            print(f"  Audio encoding error: {e}")
-            return None
-    
-    def _write_item(self, item: dict, tensors_dir: Path, all_metadata: list, metadata_lock: threading.Lock):
-        """Write a single item to disk. Thread-safe."""
-        item_name = item['item_name'].replace('/', '_').replace(' ', '_')
-        
-        # Save phoneme ids
-        phoneme_ids_tensor = torch.tensor(item['phoneme_ids'], dtype=torch.long)
-        torch.save(phoneme_ids_tensor, tensors_dir / f"{item_name}_phonemes.pt")
-        
-        # Save style embedding
-        style_tensor = torch.from_numpy(item['style_emb']) if isinstance(item['style_emb'], np.ndarray) else item['style_emb']
-        torch.save(style_tensor, tensors_dir / f"{item_name}_style.pt")
-        
-        # Save audio codec
-        if item.get('audio') is not None:
-            audio_tensor = torch.from_numpy(item['audio']) if isinstance(item['audio'], np.ndarray) else item['audio']
-            torch.save(audio_tensor, tensors_dir / f"{item_name}_codec.pt")
-        
-        # Thread-safe metadata append
-        with metadata_lock:
+            # Save audio codec
+            if item.get('audio') is not None:
+                audio_tensor = torch.from_numpy(item['audio']) if isinstance(item['audio'], np.ndarray) else item['audio']
+                torch.save(audio_tensor, tensors_dir / f"{item_name}_codec.pt")
+            
+            # Accumulate metadata (small, kept in memory)
             all_metadata.append({
                 'item_name': item['item_name'],
                 'text': item['text'],
@@ -478,8 +357,6 @@ if __name__ == '__main__':
                         help="Device for inference (default: cuda if available)")
     parser.add_argument("--debug", action='store_true', default=False,
                         help="Use debug dataset")
-    parser.add_argument("--num_workers", type=int, default=4,
-                        help="Number of parallel workers (default: 4)")
     args = parser.parse_args()
     
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -489,7 +366,8 @@ if __name__ == '__main__':
     for path in args.tarball:
         tarball_paths.extend(p.strip() for p in path.split(",") if p.strip())
     
-    preprocessor = DatasetPreprocessor(
+    preprocess_dataset(
+        csv_path=args.csv_path,
         output_dir=args.output_dir,
         tarball_paths=tarball_paths,
         device=device,
@@ -497,4 +375,3 @@ if __name__ == '__main__':
         debug=args.debug,
         phoneme_vocab_path=args.phoneme_vocab_path,
     )
-    preprocessor.preprocess(args.csv_path, num_workers=args.num_workers)
