@@ -138,12 +138,12 @@ class DatasetPreprocessor:
             style_emb = self.style_processor.embed(style_prompt)
         return style_emb.cpu().numpy()
     
-    def process_audio(self, wav_path: str) -> np.ndarray:
+    def process_audio(self, wav_path: str) -> Tuple[np.ndarray, np.ndarray]:
         try:
             # Look up file in tarball index
             if wav_path not in self.audio_index:
                 print(f"  Audio not found in tarball: {wav_path}")
-                return None
+                return None, None
             
             tar, member = self.audio_index[wav_path]
             
@@ -151,18 +151,18 @@ class DatasetPreprocessor:
             f = tar.extractfile(member)
             if f is None:
                 print(f"  Could not extract: {wav_path}")
-                return None
+                return None, None
             audio_bytes = f.read()
             
             # Encode with FACodec (pass bytes directly)
             with torch.no_grad():
                 codec, spk_emb = self.audio_encoder.encode(audio_bytes)
             
-            return codec.cpu().numpy()
+            return codec.cpu().numpy(), spk_emb.cpu().numpy()
     
         except Exception as e:
             print(f"  Audio encoding error: {e}")
-            return None
+            return None, None
     
     def process_row(self, row: dict) -> Optional[dict]:
         item_name = row['item_name']
@@ -174,8 +174,8 @@ class DatasetPreprocessor:
         
         style_emb = self.process_style(row['style_prompt'])
         
-        audio_data = self.process_audio(audio_path)
-        if audio_data is None:
+        codec_tokens, spk_emb = self.process_audio(audio_path)
+        if codec_tokens is None:
             return None  # Skip if audio encoding failed
         
         return {
@@ -193,7 +193,8 @@ class DatasetPreprocessor:
             'dur_label': row.get('dur', ''),
             'pitch_label': row.get('pitch', ''),
             'energy_label': row.get('energy', ''),
-            'audio': audio_data,
+            'codec_tokens': codec_tokens,
+            'spk_emb': spk_emb,
         }
     
     def preprocess(self, csv_path: str, flush_every: int = 100):
@@ -274,17 +275,18 @@ class DatasetPreprocessor:
             item_name = item['item_name'].replace('/', '_').replace(' ', '_')
             
             # Save phoneme ids as integer tensor
-            phoneme_ids_tensor = torch.tensor(item['phoneme_ids'], dtype=torch.long)
-            torch.save(phoneme_ids_tensor, tensors_dir / f"{item_name}_phonemes.pt")
+            torch.save(item['phoneme_ids'], tensors_dir / f"{item_name}_phonemes.pt")
             
             # Save style embedding
-            style_tensor = torch.from_numpy(item['style_emb']) if isinstance(item['style_emb'], np.ndarray) else item['style_emb']
-            torch.save(style_tensor, tensors_dir / f"{item_name}_style.pt")
+            torch.save(item['style_emb'], tensors_dir / f"{item_name}_style.pt")
             
             # Save audio codec
-            if item.get('audio') is not None:
-                audio_tensor = torch.from_numpy(item['audio']) if isinstance(item['audio'], np.ndarray) else item['audio']
-                torch.save(audio_tensor, tensors_dir / f"{item_name}_codec.pt")
+            if item.get('codec_tokens') is not None:
+                torch.save(item['codec_tokens'], tensors_dir / f"{item_name}_codec.pt")
+            
+            # Save speaker embedding
+            if item.get('spk_emb') is not None:
+                torch.save(item['spk_emb'], tensors_dir / f"{item_name}_spk_emb.pt")
             
             # Accumulate metadata (small, kept in memory)
             all_metadata.append({
