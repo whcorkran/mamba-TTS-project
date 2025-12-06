@@ -100,12 +100,14 @@ class MambaTTSDecoder(nn.Module):
         n_heads=8,
         d_ff=2048,
         d_style=256,
-        max_len=4096,
+        max_len=8192,  # allow flattened multi-quantizer codec sequences
+        num_quantizers=1,
     ):
         super().__init__()
         self.vocab_size_audio = vocab_size_audio
         self.token_embed = nn.Embedding(vocab_size_audio, d_model)
         self.pos_embed = nn.Embedding(max_len, d_model)
+        self.quant_embed = nn.Embedding(num_quantizers, d_model)
 
         self.layers = nn.ModuleList([
             MambaTTSDecoderLayer(d_model, n_heads, d_ff, d_style)
@@ -117,11 +119,23 @@ class MambaTTSDecoder(nn.Module):
 
     def forward(self, audio_tokens, text_hidden, z_style, text_mask=None, ref_hidden=None, ref_mask=None):
         """
-        audio_tokens: (B, T_audio) int codec ids (teacher forcing input)
+        audio_tokens: either
+            - (B, T_audio) int codec ids (single quantizer)
+            - (B, Q, T_audio) int codec ids (multi-quantizer; flattened internally)
         text_hidden: (B, T_text, d_model) text encoder outputs
         z_style: (B, d_style) style/timbre embedding
         """
-        B, T = audio_tokens.shape
+        if audio_tokens.dim() == 3:
+            # audio_tokens: (B, Q, T)
+            B, Q, T = audio_tokens.shape
+            audio_tokens = audio_tokens.reshape(B, Q * T)
+            quant_ids = torch.arange(Q, device=audio_tokens.device).repeat_interleave(T)
+            quant_ids = quant_ids.unsqueeze(0).expand(B, -1)
+        elif audio_tokens.dim() == 2:
+            B, T = audio_tokens.shape
+            quant_ids = torch.zeros_like(audio_tokens)
+        else:
+            raise ValueError("audio_tokens must be (B, T) or (B, Q, T)")
         device = audio_tokens.device
 
         # text_mask: optional (B, T_text) bool. If ref_hidden is provided we
@@ -151,9 +165,10 @@ class MambaTTSDecoder(nn.Module):
                 text_mask = torch.cat([ref_mask, text_mask], dim=1)
 
         tok = self.token_embed(audio_tokens)
+        qemb = self.quant_embed(quant_ids)
         pos_ids = torch.arange(T, device=device)
         pos = self.pos_embed(pos_ids)[None, :, :].expand(B, T, -1)
-        x = tok + pos
+        x = tok + pos + qemb
 
         mamba_states = [None] * len(self.layers)
         for i, layer in enumerate(self.layers):
