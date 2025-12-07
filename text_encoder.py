@@ -32,7 +32,7 @@ class TextEncoder(nn.Module):
     def __init__(
         self,
         vocab_size,
-        d_model=256,
+        d_model=512,  # Changed from 256 to match ControlSpeech paper
         n_layers=4,
         n_head=2,
         d_k=64,
@@ -138,7 +138,7 @@ class DurationPredictor(nn.Module):
     
     def __init__(
         self,
-        d_model=256,
+        d_model=512,  # Changed from 256 to match ControlSpeech paper
         filter_size=256,
         kernel_size=3,
         dropout=0.1,

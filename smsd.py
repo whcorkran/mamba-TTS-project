@@ -23,11 +23,11 @@ class SMSD(nn.Module):
         self,
         bert_model="bert-base-uncased",
         bert_dim=768,
-        style_dim=256,  # Dimension of Y'_s from FACodec (can be 512 if using different config)
-        num_mixtures=5,  # K: number of Gaussian components
+        style_dim=512,  # ControlSpeech paper: 512-dimensional global ground truth style vector from FACodec
+        num_mixtures=5,  # K: number of Gaussian components (from paper Appendix H)
         hidden_dim=512,  # MLP hidden dimension
         dropout=0.1,
-        variance_mode="isotropic_across_clusters",  # "isotropic_across_clusters", "isotropic", "diagonal", "fixed"
+        variance_mode="isotropic_across_clusters",  # Best performing mode (from paper Appendix I)
         freeze_bert=True,
     ):
         super().__init__()
@@ -421,4 +421,5 @@ def test_smsd():
 
 if __name__ == "__main__":
     test_smsd()
+
 

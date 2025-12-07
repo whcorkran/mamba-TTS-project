@@ -96,10 +96,10 @@ class MambaTTSDecoder(nn.Module):
         self,
         vocab_size_audio,
         d_model=512,
-        n_layers=8,
+        n_layers=6,  # ControlSpeech paper: 6 decoder layers (fewer than typical)
         n_heads=8,
         d_ff=2048,
-        d_style=256,
+        d_style=512,  # ControlSpeech paper: 512-dim style vector from FACodec
         max_len=4096,
     ):
         super().__init__()

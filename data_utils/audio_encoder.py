@@ -114,11 +114,16 @@ class FACodecEncoder:
     """
     FACodec pretrained model from
     https://github.com/lifeiteng/naturalspeech3_facodec.git
+    
+    Note: FACodec timbre encoder outputs 256-dim, but ControlSpeech paper 
+    specifies 512-dim style vectors. A projection layer (256→512) is always
+    applied to match the architecture requirements.
     """
 
     def __init__(self, max_seq_len: int = 1024):
         super().__init__()
         self.max_seq_len = max_seq_len
+        
         self.fa_encoder = FACodecEncoder2(
             ngf=32,
             up_ratios=[2, 4, 5, 5],
@@ -153,6 +158,17 @@ class FACodecEncoder:
 
         self.fa_encoder.eval().requires_grad_(False)
         self.fa_decoder.eval().requires_grad_(False)
+        
+        # Projection layer to match ControlSpeech paper's 512-dim style vector
+        # This is REQUIRED by the architecture (not optional)
+        import torch.nn as nn
+        self.style_projection = nn.Sequential(
+            nn.Linear(256, 512),
+            nn.LayerNorm(512),
+        )
+        # Initialize projection weights
+        nn.init.xavier_uniform_(self.style_projection[0].weight)
+        nn.init.zeros_(self.style_projection[0].bias)
 
     def encode(self, wav: str | bytes | list[str | bytes], sr: int = 16000):
         """Encode audio file(s) to FACodec tokens.
@@ -222,6 +238,10 @@ class FACodecEncoder:
 
         # ControlSpeech expects concat(Ys, Yc) along quantizer dimension
         codec = torch.cat((Ys, Yc), dim=0)  # (5, B, T)
+
+        # Project spk_embs from 256 to 512 to match ControlSpeech paper
+        # This is ALWAYS done (required by architecture)
+        spk_embs = self.style_projection(spk_embs)  # (B, 256) -> (B, 512)
 
         # Return (B, T, C)
         return codec.permute(1, 2, 0), spk_embs

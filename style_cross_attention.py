@@ -293,11 +293,11 @@ class StyleConditioningPipeline(nn.Module):
     This wraps all the cross-attention layers and length regulation
     into a single module for easy integration.
     """
-    def __init__(self, d_style=256, d_model=512, num_heads=8, dropout=0.1):
+    def __init__(self, d_style=512, d_model=512, num_heads=8, dropout=0.1):
         """
         Args:
-            d_style: Dimension of SMSD output
-            d_model: Model hidden dimension
+            d_style: Dimension of SMSD output (512 as per ControlSpeech paper)
+            d_model: Model hidden dimension (512 as per ControlSpeech paper)
             num_heads: Number of attention heads
             dropout: Dropout rate
         """
@@ -361,8 +361,8 @@ def test_style_cross_attention():
     # Parameters
     batch_size = 4
     T_text = 20      # phoneme sequence length
-    d_style = 256    # SMSD output dimension
-    d_model = 512    # model hidden dimension
+    d_style = 512    # SMSD output dimension (ControlSpeech paper)
+    d_model = 512    # model hidden dimension (ControlSpeech paper)
     
     # Initialize pipeline
     pipeline = StyleConditioningPipeline(
@@ -428,4 +428,5 @@ def test_style_cross_attention():
 
 if __name__ == "__main__":
     test_style_cross_attention()
+
 
