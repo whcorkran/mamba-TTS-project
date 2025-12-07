@@ -17,7 +17,7 @@ from scipy.io import wavfile
 import torch
 import torchaudio
 
-from lib.naturalspeech3_facodec.ns3_codec import FACodecEncoder2, FACodecDecoder2
+from lib.naturalspeech3_facodec.ns3_codec import FACodecEncoderV2, FACodecDecoderV2
 from huggingface_hub import hf_hub_download
 
 
@@ -120,16 +120,19 @@ class FACodecEncoder:
     applied to match the architecture requirements.
     """
 
-    def __init__(self, max_seq_len: int = 1024):
+    def __init__(self, max_seq_len: int = 1024, device: str = None):
         super().__init__()
         self.max_seq_len = max_seq_len
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         
-        self.fa_encoder = FACodecEncoder2(
+        # Use FACodec V2 classes with V2 checkpoints from HuggingFace
+        # (from official test.py in naturalspeech3_facodec repo)
+        self.fa_encoder = FACodecEncoderV2(
             ngf=32,
             up_ratios=[2, 4, 5, 5],
             out_channels=256,
         )
-        self.fa_decoder = FACodecDecoder2(
+        self.fa_decoder = FACodecDecoderV2(
             in_channels=256,
             upsample_initial_channel=1024,
             ngf=32,
@@ -147,17 +150,18 @@ class FACodecEncoder:
             use_gr_residual_phone=True,
         )
         encoder_ckpt = hf_hub_download(
-            repo_id="amphion/naturalspeech3_facodec", filename="ns3_facodec_encoder.bin"
+            repo_id="amphion/naturalspeech3_facodec", filename="ns3_facodec_encoder_v2.bin"
         )
         decoder_ckpt = hf_hub_download(
-            repo_id="amphion/naturalspeech3_facodec", filename="ns3_facodec_decoder.bin"
+            repo_id="amphion/naturalspeech3_facodec", filename="ns3_facodec_decoder_v2.bin"
         )
 
         self.fa_encoder.load_state_dict(torch.load(encoder_ckpt, weights_only=True))
         self.fa_decoder.load_state_dict(torch.load(decoder_ckpt, weights_only=True))
 
-        self.fa_encoder.eval().requires_grad_(False)
-        self.fa_decoder.eval().requires_grad_(False)
+        # Move to device and set eval mode
+        self.fa_encoder.to(self.device).eval().requires_grad_(False)
+        self.fa_decoder.to(self.device).eval().requires_grad_(False)
         
         # Projection layer to match ControlSpeech paper's 512-dim style vector
         # This is REQUIRED by the architecture (not optional)
@@ -169,6 +173,8 @@ class FACodecEncoder:
         # Initialize projection weights
         nn.init.xavier_uniform_(self.style_projection[0].weight)
         nn.init.zeros_(self.style_projection[0].bias)
+        # Move projection to device
+        self.style_projection.to(self.device)
 
     def encode(self, wav: str | bytes | list[str | bytes], sr: int = 16000):
         """Encode audio file(s) to FACodec tokens.
@@ -204,18 +210,31 @@ class FACodecEncoder:
         # Pad to same length and stack
         max_len = max(t.shape[0] for t in audio_tensors)
         padded = [torch.nn.functional.pad(t, (0, max_len - t.shape[0])) for t in audio_tensors]
-        audio_batch = torch.stack(padded, dim=0).unsqueeze(1)  # (B, 1, T)
+        audio_batch = torch.stack(padded, dim=0).unsqueeze(1).to(self.device)  # (B, 1, T)
         
+        # V2 encoder/decoder API requires prosody features
         enc = self.fa_encoder(audio_batch)
+        prosody = self.fa_encoder.get_prosody_feature(audio_batch)
+        
+        # Align prosody length to match enc length (they can differ by 1 frame)
+        if prosody.shape[2] != enc.shape[2]:
+            if prosody.shape[2] > enc.shape[2]:
+                prosody = prosody[:, :, :enc.shape[2]]
+            else:
+                pad_len = enc.shape[2] - prosody.shape[2]
+                prosody = torch.nn.functional.pad(prosody, (0, pad_len))
+        
         vq_pos_emb, vq_id, _, quantized, spk_embs = self.fa_decoder(
-            enc, eval_vq=False, vq=True
+            enc, prosody, eval_vq=False, vq=True
         )
-        # FACodec ordering:
+        # FACodec V2 ordering (from official test.py):
         # vq_id shape: (num_quantizers, B, T)
-        # Qc = content, Qp = prosody, Qr = 3 residual/acoustic levels
-        Qc = vq_id[0:1]       # (1, B, T)
-        Qp = vq_id[1:2]       # (1, B, T)
-        Qr = vq_id[2:]        # (3, B, T)
+        # prosody_code = vq_id[:1]      # (1, B, T)
+        # content_code = vq_id[1:3]     # (2, B, T)
+        # residual_code = vq_id[3:]     # (3, B, T)
+        Qp = vq_id[:1]        # prosody (1, B, T)
+        Qc = vq_id[1:3]       # content (2, B, T)
+        Qr = vq_id[3:]        # residual (3, B, T)
 
         # pad or truncate to max_seq_len
         # as per paper, each token corresponds to 12.5ms of audio
@@ -228,16 +247,16 @@ class FACodecEncoder:
                 return torch.cat([q, torch.zeros(q.shape[0], q.shape[1], pad_len, device=q.device)], dim=2)
             return q
         
-        Qc = pad_or_truncate(Qc)
-        Qp = pad_or_truncate(Qp)
-        Qr = pad_or_truncate(Qr)
+        Qp = pad_or_truncate(Qp)  # (1, B, T) prosody
+        Qc = pad_or_truncate(Qc)  # (2, B, T) content
+        Qr = pad_or_truncate(Qr)  # (3, B, T) residual
 
         # Style codec = prosody + residuals
         Ys = torch.cat((Qp, Qr), dim=0)  # (4, B, T)
-        Yc = Qc                          # (1, B, T)
+        Yc = Qc                          # (2, B, T)
 
         # ControlSpeech expects concat(Ys, Yc) along quantizer dimension
-        codec = torch.cat((Ys, Yc), dim=0)  # (5, B, T)
+        codec = torch.cat((Ys, Yc), dim=0)  # (6, B, T)
 
         # Project spk_embs from 256 to 512 to match ControlSpeech paper
         # This is ALWAYS done (required by architecture)
