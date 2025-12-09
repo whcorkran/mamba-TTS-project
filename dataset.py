@@ -91,22 +91,79 @@ class VccmTTSDataset(Dataset):
         speaker_waveform = self._wav_to_tensor(speaker_name)
         target_waveform = self._wav_to_tensor(item_name)
 
+        # Load MFA durations (REQUIRED for proper ControlSpeech training)
+        # CHECK SETUP_AND_RUN.txt FOR MORE INFORMATION
+        durations = None
+        tg_path = Path(self.audio_root).parent / 'mfa_outputs' / f'{item_name}.TextGrid'
+        if tg_path.exists():
+            durations = self._load_durations_from_textgrid(tg_path, sample['txt'])
+        
         return {
             'voice_waveform': speaker_waveform,
             'text_prompt': sample['txt'],
             'style_prompt': sample['style_prompt'],
+            'durations': durations,  # None if MFA not available (will use fallback)
         }, target_waveform
+    
+    def _load_durations_from_textgrid(self, tg_path, text):
+        """
+        Extract phoneme durations from MFA TextGrid file.
+        
+        Args:
+            tg_path: Path to .TextGrid file
+            text: Original text (for validation)
+        
+        Returns:
+            durations: torch.FloatTensor of phoneme durations (in frames)
+        """
+        try:
+            from textgrid import TextGrid
+            
+            tg = TextGrid.fromFile(str(tg_path))
+            phone_tier = tg[1]  # Usually tier 1 contains phone alignments
+            
+            durations = []
+            hop_size = 256  # FACodec hop size
+            sample_rate = self.sample_rate
+            
+            for interval in phone_tier:
+                # Convert time to frame count
+                duration_sec = interval.maxTime - interval.minTime
+                duration_frames = int(duration_sec * sample_rate / hop_size)
+                durations.append(max(1, duration_frames))  # At least 1 frame
+            
+            return torch.FloatTensor(durations)
+        except Exception as e:
+            print(f"Warning: Failed to load durations from {tg_path}: {e}")
+            return None
 
     def collate_fn(self, batch):
         voices = [item[0]['voice_waveform'] for item in batch]
         texts = [item[0]['text_prompt'] for item in batch]
         styles = [item[0]['style_prompt'] for item in batch]
         targets = [item[1] for item in batch]
-        return {
+        
+        # Collate durations if available from MFA preprocessing
+        durations = [item[0].get('durations') for item in batch]
+        durations_padded = None
+        
+        if all(d is not None for d in durations):
+            # Pad durations to same length
+            max_len = max(len(d) for d in durations)
+            durations_padded = torch.zeros(len(batch), max_len)
+            for i, d in enumerate(durations):
+                durations_padded[i, :len(d)] = d
+        
+        result = {
             'voice_waveform': torch.stack(voices),
             'text_prompt': texts,
             'style_prompt': styles,
-        }, torch.stack(targets)
+        }
+        
+        if durations_padded is not None:
+            result['durations'] = durations_padded
+        
+        return result, torch.stack(targets)
 
 if __name__ == "__main__":
     # Test the dataset with proper validation

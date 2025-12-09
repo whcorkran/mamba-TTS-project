@@ -6,7 +6,9 @@ from mamba_ssm import Mamba
 
 """Mamba-based TTS decoder module.
 
-From MAVE paper:
+Architecture: Replaces ControlSpeech's Transformer decoder with MAVE's Mamba decoder
+
+From MAVE paper (arXiv:2510.04738):
 - `Mamba(d_model)` constructs a layer-like callable.
 - Calling signature: `out, new_state = mamba(x)` for full-sequence or
     `out, new_state = mamba(x, state)` for step-wise updates.
@@ -14,8 +16,18 @@ From MAVE paper:
     opaque per-layer state that can be stored and passed back for incremental
     decoding. The decoder below relies on those semantics.
 
+Layer Structure (per MAVE):
+- Mamba SSM: Efficient sequence modeling (O(n) vs Transformer's O(n²))
+- Cross-Attention: Attend to styled_frames (content+style+timing from ControlSpeech pipeline)
+- FFN: Feed-forward transformation
+
+Inputs (per ControlSpeech + MAVE):
+- audio_tokens: Codec tokens for teacher forcing
+- styled_frames: Output from StyleConditioningPipeline (already contains style via cross-attentions)
+- ref_hidden: Voice prompt embeddings (timbre from reference speaker)
+
 This file includes:
-- `MambaTTSDecoderLayer` : single layer (Mamba + cross-attn + FiLM + FFN)
+- `MambaTTSDecoderLayer` : single layer (Mamba + cross-attn + FFN)
 - `MambaTTSDecoder` : stacked decoder with utilities for full-sequence and
     single-step (autoregressive) decoding. Use `decode_step` for single-token
     generation (it manages per-layer Mamba states and positional indexing).
@@ -23,7 +35,7 @@ This file includes:
 
 
 class MambaTTSDecoderLayer(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, d_style):
+    def __init__(self, d_model, n_heads, d_ff):
         super().__init__()
         self.norm_mamba = nn.LayerNorm(d_model)
         self.mamba = Mamba(d_model)
@@ -42,19 +54,20 @@ class MambaTTSDecoderLayer(nn.Module):
             nn.Linear(d_ff, d_model),
         )
 
-        self.style_mlp = nn.Sequential(
-            nn.Linear(d_style, 2 * d_model),
-            nn.Tanh(),
-        )
-
     def forward(
         self,
         x,
-        text_hidden,
-        z_style,
-        text_mask=None,
+        styled_frames,
+        styled_mask=None,
         mamba_state=None,
     ):
+        """
+        Args:
+            x: (B, T, d_model) - decoder input (embedded audio tokens)
+            styled_frames: (B, T_frame, d_model) - style-conditioned frames from pipeline
+            styled_mask: (B, T_frame) - mask for styled_frames (True=valid, False=pad)
+            mamba_state: Optional Mamba state for autoregressive decoding
+        """
         # 1) Mamba: main sequence modeling
         h = self.norm_mamba(x)
         if mamba_state is None:
@@ -63,28 +76,23 @@ class MambaTTSDecoderLayer(nn.Module):
             h_mamba, new_state = self.mamba(h, mamba_state)
         x = x + h_mamba
 
-        # 2) Cross-attention to text
+        # 2) Cross-attention to styled frames (contains content+style+timing)
         h = self.norm_cross(x)
         key_padding_mask = None
-        if text_mask is not None:
-            key_padding_mask = ~text_mask
+        if styled_mask is not None:
+            # Convert True=valid to False=valid for PyTorch's convention
+            key_padding_mask = ~styled_mask
 
         attn_out, _ = self.cross_attn(
             query=h,
-            key=text_hidden,
-            value=text_hidden,
+            key=styled_frames,
+            value=styled_frames,
             key_padding_mask=key_padding_mask,
         )
         x = x + attn_out
 
-        # 3) Style FiLM + FFN
+        # 3) FFN
         h = self.norm_ff(x)
-        gamma_beta = self.style_mlp(z_style)
-        gamma, beta = torch.chunk(gamma_beta, 2, dim=-1)
-        gamma = gamma.unsqueeze(1)
-        beta = beta.unsqueeze(1)
-        h = gamma * h + beta
-
         ff_out = self.ff(h)
         x = x + ff_out
 
@@ -96,34 +104,43 @@ class MambaTTSDecoder(nn.Module):
         self,
         vocab_size_audio,
         d_model=512,
-        n_layers=8,
+        n_layers=6,  # Per ControlSpeech Appendix F
         n_heads=8,
         d_ff=2048,
-        d_style=256,
         max_len=8192,  # allow flattened multi-quantizer codec sequences
-        num_quantizers=1,
+        num_quantizers=6,  # FACodec uses 6 quantizers (1 prosody + 2 content + 3 residual)
     ):
         super().__init__()
         self.vocab_size_audio = vocab_size_audio
+        self.d_model = d_model
         self.token_embed = nn.Embedding(vocab_size_audio, d_model)
         self.pos_embed = nn.Embedding(max_len, d_model)
+        # Quantizer embeddings: Custom addition for multi-quantizer FACodec (not in papers)
+        # Helps distinguish between prosody/content/residual quantizers
         self.quant_embed = nn.Embedding(num_quantizers, d_model)
 
         self.layers = nn.ModuleList([
-            MambaTTSDecoderLayer(d_model, n_heads, d_ff, d_style)
+            MambaTTSDecoderLayer(d_model, n_heads, d_ff)
             for _ in range(n_layers)
         ])
 
         self.norm_out = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size_audio)
 
-    def forward(self, audio_tokens, text_hidden, z_style, text_mask=None, ref_hidden=None, ref_mask=None):
+    def forward(self, audio_tokens, styled_frames, styled_mask=None, ref_hidden=None, ref_mask=None):
         """
-        audio_tokens: either
-            - (B, T_audio) int codec ids (single quantizer)
-            - (B, Q, T_audio) int codec ids (multi-quantizer; flattened internally)
-        text_hidden: (B, T_text, d_model) text encoder outputs
-        z_style: (B, d_style) style/timbre embedding
+        Forward pass for teacher-forced training.
+        
+        Args:
+            audio_tokens: (B, Q*T) or (B, Q, T) - codec tokens for teacher forcing
+            styled_frames: (B, T_frame, d_model) - style-conditioned frames from pipeline
+                Contains: content (from text) + style (from SMSD cross-attentions) + timing (from length regulation)
+            styled_mask: (B, T_frame) bool - True=valid, False=padding
+            ref_hidden: (B, T_ref, d_model) - voice prompt embeddings for timbre cloning
+            ref_mask: (B, T_ref) bool - True=valid, False=padding
+        
+        Returns:
+            logits: (B, T_audio, vocab_size_audio) - predicted codec token logits
         """
         if audio_tokens.dim() == 3:
             # audio_tokens: (B, Q, T)
@@ -138,13 +155,21 @@ class MambaTTSDecoder(nn.Module):
             raise ValueError("audio_tokens must be (B, T) or (B, Q, T)")
         device = audio_tokens.device
 
-        # text_mask: optional (B, T_text) bool. If ref_hidden is provided we
-        # will prepend ref_hidden to text_hidden and update text_mask.
-        if text_mask is not None:
-            assert text_mask.dim() == 2 and text_mask.shape[0] == B, (
-                "text_mask must be shape (B, T_text) with dtype=bool"
+        # Validate styled_frames
+        assert styled_frames.dim() == 3 and styled_frames.shape[0] == B, (
+            f"styled_frames must be (B, T_frame, d_model), got {styled_frames.shape}"
+        )
+        
+        # Validate mask if provided
+        if styled_mask is not None:
+            assert styled_mask.dim() == 2 and styled_mask.shape[0] == B, (
+                "styled_mask must be shape (B, T_frame) with dtype=bool"
             )
 
+        # Prepend reference embeddings for timbre conditioning (MAVE-style)
+        conditioning_frames = styled_frames
+        conditioning_mask = styled_mask
+        
         if ref_hidden is not None:
             # ref_hidden: (B, T_ref, d_model)
             assert ref_hidden.dim() == 3 and ref_hidden.shape[0] == B, (
@@ -157,12 +182,12 @@ class MambaTTSDecoder(nn.Module):
                     "ref_mask must be (B, T_ref) bool"
                 )
 
-            # Prepend reference embeddings so cross-attention can attend to them
-            text_hidden = torch.cat([ref_hidden, text_hidden], dim=1)
-            if text_mask is None:
-                text_mask = ref_mask
+            # Concatenate: [ref_hidden || styled_frames] so decoder can attend to both
+            conditioning_frames = torch.cat([ref_hidden, styled_frames], dim=1)
+            if conditioning_mask is None:
+                conditioning_mask = ref_mask
             else:
-                text_mask = torch.cat([ref_mask, text_mask], dim=1)
+                conditioning_mask = torch.cat([ref_mask, conditioning_mask], dim=1)
 
         tok = self.token_embed(audio_tokens)
         qemb = self.quant_embed(quant_ids)
@@ -174,9 +199,8 @@ class MambaTTSDecoder(nn.Module):
         for i, layer in enumerate(self.layers):
             x, new_state = layer(
                 x=x,
-                text_hidden=text_hidden,
-                z_style=z_style,
-                text_mask=text_mask,
+                styled_frames=conditioning_frames,
+                styled_mask=conditioning_mask,
                 mamba_state=mamba_states[i],
             )
             mamba_states[i] = new_state
@@ -188,11 +212,10 @@ class MambaTTSDecoder(nn.Module):
     def decode_step(
         self,
         last_token,
-        text_hidden,
-        z_style,
+        styled_frames,
         mamba_states,
         step_index: int,
-        text_mask=None,
+        styled_mask=None,
         ref_hidden=None,
         ref_mask=None,
     ):
@@ -200,12 +223,13 @@ class MambaTTSDecoder(nn.Module):
 
         Args:
             last_token: (B, 1) int tensor containing the most recent audio token.
-            text_hidden: (B, T_text, d_model) encoder outputs.
-            z_style: (B, d_style) style embedding.
+            styled_frames: (B, T_frame, d_model) - style-conditioned frames from pipeline.
             mamba_states: list of per-layer states (length == n_layers). Each
                 entry may be None for the first step.
             step_index: int, absolute position index of this token (0-based).
-            text_mask: optional (B, T_text) boolean mask for text padding.
+            styled_mask: optional (B, T_frame) boolean mask for styled_frames padding.
+            ref_hidden: optional (B, T_ref, d_model) - voice prompt embeddings.
+            ref_mask: optional (B, T_ref) bool - mask for ref_hidden.
 
         Returns:
             logits: (B, 1, vocab_size_audio)
@@ -220,9 +244,10 @@ class MambaTTSDecoder(nn.Module):
         pos = self.pos_embed(pos_id)[None, :, :].expand(B_local, 1, -1)
         x = tok + pos
 
-        # If reference embeddings are provided, prepend them to text_hidden and
-        # update text_mask so cross-attention sees reference tokens the same
-        # way as in `forward`.
+        # Prepend reference embeddings to styled_frames for timbre conditioning
+        conditioning_frames = styled_frames
+        conditioning_mask = styled_mask
+        
         if ref_hidden is not None:
             assert ref_hidden.dim() == 3 and ref_hidden.shape[0] == B_local, (
                 "ref_hidden must be (B, T_ref, d_model)"
@@ -234,19 +259,18 @@ class MambaTTSDecoder(nn.Module):
                     "ref_mask must be (B, T_ref) bool"
                 )
 
-            text_hidden = torch.cat([ref_hidden, text_hidden], dim=1)
-            if text_mask is None:
-                text_mask = ref_mask
+            conditioning_frames = torch.cat([ref_hidden, styled_frames], dim=1)
+            if conditioning_mask is None:
+                conditioning_mask = ref_mask
             else:
-                text_mask = torch.cat([ref_mask, text_mask], dim=1)
+                conditioning_mask = torch.cat([ref_mask, conditioning_mask], dim=1)
 
         new_states = [None] * len(self.layers)
         for i, layer in enumerate(self.layers):
             x, new_state = layer(
                 x=x,
-                text_hidden=text_hidden,
-                z_style=z_style,
-                text_mask=text_mask,
+                styled_frames=conditioning_frames,
+                styled_mask=conditioning_mask,
                 mamba_state=mamba_states[i] if mamba_states is not None else None,
             )
             new_states[i] = new_state

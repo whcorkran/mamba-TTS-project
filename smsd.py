@@ -27,7 +27,7 @@ class SMSD(nn.Module):
         num_mixtures=5,  # K: number of Gaussian components (from paper Appendix H)
         hidden_dim=512,  # MLP hidden dimension
         dropout=0.1,
-        variance_mode="isotropic_across_clusters",  # Best performing mode (from paper Appendix I)
+        variance_mode="isotropic_across_clusters",  # "isotropic_across_clusters", "isotropic", "diagonal", "fixed"
         freeze_bert=True,
     ):
         super().__init__()

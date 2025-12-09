@@ -112,12 +112,22 @@ class BaseAudioPreprocessor:
 
 class FACodecEncoder:
     """
-    FACodec pretrained model from
-    https://github.com/lifeiteng/naturalspeech3_facodec.git
+    FACodec pretrained audio codec encoder (FROZEN - NOT TRAINED)
+    Source: https://github.com/lifeiteng/naturalspeech3_facodec.git
     
-    Note: FACodec timbre encoder outputs 256-dim, but ControlSpeech paper 
-    specifies 512-dim style vectors. A projection layer (256→512) is always
-    applied to match the architecture requirements.
+    This is a PRETRAINED model downloaded from HuggingFace that is used frozen:
+    - Encoder: Converts audio → continuous representations
+    - Decoder: Quantizes into discrete codec tokens (6 quantizers total)
+    - Output: Codec tokens (B, T, 6) + Timbre embeddings (B, 256)
+    
+    Timbre Embeddings vs Style Vectors:
+    - FACodec outputs 256-dim timbre embeddings (speaker identity)
+    - ControlSpeech needs 512-dim style vectors (timbre + prosody + emotion)
+    - Solution: Project 256→512 with learned linear layer
+    - This projection is TRAINABLE (part of your model)
+    
+    Note: FACodec itself is frozen and reused from pretrained checkpoint.
+    Only the 256→512 projection layer is trained with your TTS model.
     """
 
     def __init__(self, max_seq_len: int = 1024, device: str = None):

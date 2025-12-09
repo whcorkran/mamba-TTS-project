@@ -1,0 +1,88 @@
+# ControlSpeech + Mamba TTS Training Configuration
+# Based on ControlSpeech paper (arXiv:2406.01205) and baseline configs
+
+# Training hyperparameters
+training:
+  batch_size: 32  # Increased from 10 (baseline uses 16-64)
+  max_steps: 400000  # Full training (use 10 for sanity check)
+  
+  # Optimizer settings (from baseline configs)
+  lr: 0.0002  # 2e-4 (baseline PromptStyle)
+  betas: [0.8, 0.99]  # Changed from default [0.9, 0.999]
+  eps: 1.0e-9  # Changed from default 1e-8
+  weight_decay: 0.0
+  
+  # Learning rate schedule
+  warmup_steps: 800  # Warmup period
+  lr_decay: 0.999875  # Exponential decay per step
+  
+  # Gradient clipping
+  clip_grad_norm: 1.0
+  
+  # Loss weights (from ControlSpeech baseline)
+  w_codec: 1.0  # Codec reconstruction (main loss)
+  w_dur: 1.0  # Duration prediction (matches baseline)
+  w_smsd: 0.5  # Style mixture density loss
+  
+  # Logging and Checkpointing
+  log_interval: 100
+  save_interval: 5000  # Validate and save best model every N steps
+  save_last_checkpoint: true  # Keep last checkpoint for crash recovery
+  
+  # Early Stopping (optional - set patience to 0 to disable)
+  early_stopping_patience: 10  # Stop if no improvement for N validation checks (0 = disabled)
+  early_stopping_min_delta: 0.001  # Minimum improvement to count as better
+  
+  # Device
+  device: cuda  # "cuda" or "cpu" (auto-detect in code)
+  seed: 1234
+
+# Model architecture - CONFIGURABLE hyperparameters only
+# (Architecture constants are hardcoded in code)
+model:
+  # Text Encoder (FastSpeech2-style FFT blocks)
+  text_encoder:
+    n_layers: 4  # Number of FFT blocks (baseline: 4, can experiment)
+    dropout: 0.1
+  
+  # Duration Predictor
+  duration_predictor:
+    dropout: 0.1
+  
+  # SMSD (Style Mixture Semantic Density)
+  smsd:
+    num_mixtures: 5  # K Gaussian components (paper tested: 3, 5, 7)
+    dropout: 0.1
+    variance_mode: "isotropic_across_clusters"  # Paper tested different modes
+  
+  # Style Conditioning Pipeline
+  style_conditioning:
+    dropout: 0.1
+  
+  # Mamba Decoder (MAVE architecture)
+  mamba_decoder:
+    n_layers: 6  # Number of Mamba layers (per ControlSpeech Appendix F: 6)
+    max_len: 8192  # Max sequence length for positional encoding
+
+# Data configuration
+data:
+  # Dataset paths
+  csv_path: "VccmDataset/controlspeech_train.csv"
+  audio_root: "VccmDataset/TextrolSpeech_data.tar.gz"
+  
+  # Validation split (for best model selection and early stopping)
+  validation_csv: null  # Optional separate validation CSV (null = use train split)
+  validation_split: 0.01  # If no validation_csv, use this fraction of training data (1% = ~100 samples)
+  
+  # DataLoader settings
+  num_workers: 0  # Number of data loading workers (0 for debugging)
+  shuffle: true
+  pin_memory: true
+
+# Paths
+paths:
+  phoneme_vocab: "phoneme_vocab.json"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  output_dir: "outputs"
+
