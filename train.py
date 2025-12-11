@@ -69,24 +69,23 @@ Architecture Notes:
 
 import argparse
 from pathlib import Path
-from typing import Tuple, Dict, Any
+from typing import Dict
 import yaml
 import json
 from datetime import datetime
+import sys
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
-import torchaudio
-import tempfile
+from tqdm import tqdm
 
-from dataset import VccmTTSDataset
+from dataset import PreprocessedTTSDataset
 from text_encoder import TextProcessor, TextEncoder, DurationPredictor
 from smsd import SMSD
 from style_cross_attention import StyleConditioningPipeline
 from mamba_decoder import MambaTTSDecoder
-from data_utils.audio_encoder import FACodecEncoder
 
 
 # ============================================================================
@@ -94,7 +93,7 @@ from data_utils.audio_encoder import FACodecEncoder
 # ============================================================================
 D_MODEL = 512  # ControlSpeech hidden dimension
 D_STYLE = 512  # Style vector dimension (after FACodec 256→512 projection)
-VOCAB_SIZE_AUDIO = 10  # FACodec codebook size per quantizer
+VOCAB_SIZE_AUDIO = 1024  # FACodec codebook size per quantizer
 NUM_QUANTIZERS = 6  # FACodec: 1 prosody + 2 content + 3 residual
 SAMPLE_RATE = 16000  # FACodec operates at 16kHz
 BERT_MODEL = "bert-base-uncased"  # SMSD always uses this
@@ -161,122 +160,89 @@ def codec_ce_loss(logits: torch.Tensor, targets: torch.Tensor, pad_id: int = 0) 
 
 def build_models(config: Config, device: torch.device):
     """Build all models according to config"""
+    print("\n" + "=" * 60)
+    print("Building models...")
+    print("=" * 60)
+    
+    print("  [1/6] Loading phoneme vocabulary...", end=" ", flush=True)
     vocab_path = Path(config.paths.phoneme_vocab)
     text_processor = TextProcessor(vocab_path=str(vocab_path))
+    print(f"✓ ({text_processor.vocab_size} tokens)")
 
+    print("  [2/6] Building TextEncoder...", end=" ", flush=True)
     text_encoder = TextEncoder(
         vocab_size=text_processor.vocab_size,
         d_model=D_MODEL,
-        n_layers=config.model.text_encoder.n_layers,  # Configurable
+        n_layers=config.model.text_encoder.n_layers,
         n_head=TEXT_N_HEADS,
         d_k=TEXT_D_K,
         d_v=TEXT_D_V,
         d_inner=TEXT_D_INNER,
         kernel_size=TEXT_KERNEL_SIZE,
-        dropout=config.model.text_encoder.dropout,  # Configurable
+        dropout=config.model.text_encoder.dropout,
         max_seq_len=TEXT_MAX_SEQ_LEN,
     ).to(device)
+    print(f"✓ ({config.model.text_encoder.n_layers} layers)")
 
+    print("  [3/6] Building DurationPredictor...", end=" ", flush=True)
     dur_predictor = DurationPredictor(
         d_model=D_MODEL,
         filter_size=DUR_FILTER_SIZE,
         kernel_size=DUR_KERNEL_SIZE,
-        dropout=config.model.duration_predictor.dropout,  # Configurable
+        dropout=config.model.duration_predictor.dropout,
     ).to(device)
+    print("✓")
     
+    print("  [4/6] Building SMSD (downloading BERT if needed)...", flush=True)
+    print("        This may take a minute on first run...")
     smsd = SMSD(
         bert_model=BERT_MODEL,
         bert_dim=BERT_DIM,
         style_dim=D_STYLE,
-        num_mixtures=config.model.smsd.num_mixtures,  # Configurable (paper tested 3, 5, 7)
+        num_mixtures=config.model.smsd.num_mixtures,
         hidden_dim=SMSD_HIDDEN_DIM,
-        dropout=config.model.smsd.dropout,  # Configurable
-        variance_mode=config.model.smsd.variance_mode,  # Configurable (paper tested different modes)
+        dropout=config.model.smsd.dropout,
+        variance_mode=config.model.smsd.variance_mode,
         freeze_bert=FREEZE_BERT,
     ).to(device)
+    print(f"        ✓ SMSD ready ({config.model.smsd.num_mixtures} mixtures)")
     
+    print("  [5/6] Building StyleConditioningPipeline...", end=" ", flush=True)
     style_pipe = StyleConditioningPipeline(
         d_style=D_STYLE,
         d_model=D_MODEL,
         num_heads=STYLE_NUM_HEADS,
-        dropout=config.model.style_conditioning.dropout,  # Configurable
+        dropout=config.model.style_conditioning.dropout,
     ).to(device)
+    print("✓")
 
+    print("  [6/6] Building MambaTTSDecoder...", end=" ", flush=True)
     decoder = MambaTTSDecoder(
         vocab_size_audio=VOCAB_SIZE_AUDIO,
         d_model=D_MODEL,
-        n_layers=config.model.mamba_decoder.n_layers,  # Configurable (paper uses 6)
+        n_layers=config.model.mamba_decoder.n_layers,
         n_heads=MAMBA_N_HEADS,
         d_ff=MAMBA_D_FF,
-        max_len=config.model.mamba_decoder.max_len,  # Configurable
+        max_len=config.model.mamba_decoder.max_len,
         num_quantizers=NUM_QUANTIZERS,
     ).to(device)
+    print(f"✓ ({config.model.mamba_decoder.n_layers} layers)")
+    
+    # Count parameters
+    total_params = sum(
+        sum(p.numel() for p in model.parameters())
+        for model in [text_encoder, dur_predictor, smsd, style_pipe, decoder]
+    )
+    trainable_params = sum(
+        sum(p.numel() for p in model.parameters() if p.requires_grad)
+        for model in [text_encoder, dur_predictor, smsd, style_pipe, decoder]
+    )
+    print(f"\nModel Statistics:")
+    print(f"  Total parameters: {total_params:,}")
+    print(f"  Trainable parameters: {trainable_params:,}")
+    print("=" * 60)
 
-    codec_encoder = FACodecEncoder()
-    return text_processor, text_encoder, dur_predictor, smsd, style_pipe, decoder, codec_encoder
-
-
-def prepare_text(batch_texts, text_processor: TextProcessor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Convert text prompts to padded phoneme IDs and masks.
-    Returns phoneme_ids (B, T_text) long and mask (B, T_text) bool where True=pad.
-    """
-    assert len(batch_texts) > 0, "batch_texts cannot be empty"
-    assert all(isinstance(t, str) and len(t) > 0 for t in batch_texts), "All texts must be non-empty strings"
-    
-    phoneme_ids, _, mask = text_processor.batch_process(batch_texts, pad_to_max=True)
-    phoneme_ids = phoneme_ids.to(device)
-    
-    # Mask should always be returned when pad_to_max=True
-    assert mask is not None, "text_processor.batch_process should return mask when pad_to_max=True"
-    mask = mask.to(device)
-    
-    # Validate shapes
-    assert phoneme_ids.dim() == 2, f"phoneme_ids should be 2D (B, T), got {phoneme_ids.shape}"
-    assert mask.shape == phoneme_ids.shape, f"mask shape {mask.shape} != phoneme_ids shape {phoneme_ids.shape}"
-    
-    return phoneme_ids, mask
-
-
-def encode_waveforms_to_facodec(wavs: torch.Tensor, encoder: FACodecEncoder, sample_rate: int = 16000):
-    """
-    Encode a batch of waveforms (B, 1, T) to FACodec tokens and style embeddings.
-    
-    Returns:
-        codec_tokens: (B, T_codec, C) - Audio codec tokens (6 quantizers: 4 style + 2 content)
-        style_embs: (B, 512) - Style/timbre embeddings projected to 512-dim
-    
-    Note: FACodec's encoder outputs:
-        - codec_tokens: Prosody (1) + Content (2) + Residual (3) quantizers = 6 total
-        - spk_embs: Originally 256-dim timbre, projected to 512-dim to match ControlSpeech
-    
-    These style_embs capture timbre but may not fully represent prosodic style
-    (emotion, speaking rate, pitch patterns). For full style control, consider
-    extracting additional prosody features from the audio.
-    """
-    assert wavs.dim() == 3, f"wavs must be (B, 1, T), got shape {wavs.shape}"
-    assert wavs.shape[1] == 1, f"wavs must have 1 channel, got {wavs.shape[1]}"
-    assert wavs.shape[2] > 0, "wavs must have non-zero length"
-    
-    wavs = wavs.detach().cpu()
-    paths = []
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for i, wav in enumerate(wavs):
-            path = Path(tmpdir) / f"tmp_{i}.wav"
-            torchaudio.save(str(path), wav, sample_rate)
-            paths.append(str(path))
-        codec_tokens, style_embs = encoder.encode(paths)
-    
-    # Validate FACodec outputs
-    assert codec_tokens is not None, "FACodec returned None for codec_tokens"
-    assert style_embs is not None, "FACodec returned None for style_embs"
-    assert codec_tokens.dim() == 3, f"codec_tokens should be (B, T, C), got {codec_tokens.shape}"
-    assert style_embs.dim() == 2, f"style_embs should be (B, 512), got {style_embs.shape}"
-    assert codec_tokens.shape[0] == wavs.shape[0], f"Batch size mismatch: {codec_tokens.shape[0]} != {wavs.shape[0]}"
-    assert style_embs.shape[0] == wavs.shape[0], f"Batch size mismatch: {style_embs.shape[0]} != {wavs.shape[0]}"
-    assert style_embs.shape[1] == 512, f"style_embs should be 512-dim, got {style_embs.shape[1]}"
-    
-    return codec_tokens, style_embs
+    return text_processor, text_encoder, dur_predictor, smsd, style_pipe, decoder
 
 
 def embed_codec_tokens(tokens_3d: torch.Tensor, decoder: MambaTTSDecoder):
@@ -330,10 +296,17 @@ def validate_config(config: Config):
     assert config.model.vocab_size_audio > 0, "vocab_size_audio must be positive"
     assert config.model.num_quantizers > 0, "num_quantizers must be positive"
     
-    # Dataset paths
+    # Dataset paths (updated for preprocessed data)
     from pathlib import Path
-    assert Path(config.data.csv_path).exists(), f"CSV file not found: {config.data.csv_path}"
-    assert Path(config.data.audio_root).exists(), f"Audio root not found: {config.data.audio_root}"
+    processed_dir = Path(config.data.processed_dir)
+    assert processed_dir.exists(), f"Processed data directory not found: {processed_dir}"
+    assert (processed_dir / "metadata.json").exists(), f"Metadata not found: {processed_dir / 'metadata.json'}"
+    assert (processed_dir / "tensors").exists(), f"Tensors directory not found: {processed_dir / 'tensors'}"
+    
+    mfa_root = Path(config.data.mfa_root)
+    if config.data.require_mfa:
+        assert mfa_root.exists(), f"MFA root not found: {mfa_root}"
+    
     assert Path(config.paths.phoneme_vocab).exists(), f"Phoneme vocab not found: {config.paths.phoneme_vocab}"
     assert config.training.save_interval > 0, "save_interval must be positive"
     assert config.training.early_stopping_patience >= 0, "early_stopping_patience must be non-negative (0 = disabled)"
@@ -424,42 +397,55 @@ def load_checkpoint(
     Returns:
         step: Training step to resume from
     """
+    print(f"\n{'=' * 60}")
     print(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    print(f"{'=' * 60}")
     
+    print("  Loading checkpoint file...", end=" ", flush=True)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    print("✓")
+    
+    print("  Restoring model weights...", end=" ", flush=True)
     text_encoder.load_state_dict(checkpoint['text_encoder'])
     dur_predictor.load_state_dict(checkpoint['dur_predictor'])
     smsd.load_state_dict(checkpoint['smsd'])
     style_pipe.load_state_dict(checkpoint['style_pipe'])
     decoder.load_state_dict(checkpoint['decoder'])
+    print("✓")
+    
+    print("  Restoring optimizer state...", end=" ", flush=True)
     optimizer.load_state_dict(checkpoint['optimizer'])
     scheduler.load_state_dict(checkpoint['scheduler'])
+    print("✓")
     
     step = checkpoint['step']
-    print(f"✓ Resumed from step {step}")
+    print(f"\n✓ Resumed from step {step}")
+    if 'val_loss' in checkpoint and checkpoint['val_loss'] is not None:
+        print(f"  Last validation loss: {checkpoint['val_loss']:.4f}")
+    if 'timestamp' in checkpoint:
+        print(f"  Checkpoint saved at: {checkpoint['timestamp']}")
+    print(f"{'=' * 60}")
     
     return step
 
 
 def validate(
     val_loader: DataLoader,
-    text_processor: any,
     text_encoder: nn.Module,
     dur_predictor: nn.Module,
     smsd: nn.Module,
     style_pipe: nn.Module,
     decoder: nn.Module,
-    codec_encoder: any,
     config: Config,
     device: torch.device,
     max_batches: int = None,
 ) -> Dict[str, float]:
     """
-    Run validation and return metrics
+    Run validation and return metrics (using preprocessed data)
     
     Args:
         val_loader: Validation data loader
-        text_processor, text_encoder, dur_predictor, smsd, style_pipe, decoder, codec_encoder: Model components
+        text_encoder, dur_predictor, smsd, style_pipe, decoder: Model components
         config: Training configuration
         device: Device to run on
         max_batches: Optional limit on number of batches to validate (for speed)
@@ -479,56 +465,70 @@ def validate(
     total_loss_smsd = 0.0
     num_batches = 0
     
+    # Determine total batches for progress bar
+    total_batches = min(max_batches, len(val_loader)) if max_batches else len(val_loader)
+    
     with torch.no_grad():
-        for batch_idx, batch in enumerate(val_loader):
+        pbar = tqdm(enumerate(val_loader), total=total_batches, desc="Validating", leave=False)
+        for batch_idx, batch in pbar:
             if max_batches and batch_idx >= max_batches:
                 break
                 
             try:
-                inputs, target_wav = batch
-                text_prompts = inputs["text_prompt"]
-                style_prompts = inputs["style_prompt"]
+                inputs, target_codec = batch
                 
-                # Encode target audio
-                audio_tokens, style_embs_gt = encode_waveforms_to_facodec(target_wav, codec_encoder)
-                audio_tokens = audio_tokens.to(device).long()
-                style_embs_gt = style_embs_gt.to(device)
-                B = audio_tokens.shape[0]
+                # Move tensors to device
+                phoneme_ids = inputs['phoneme_ids'].to(device)
+                phoneme_mask = inputs['phoneme_mask'].to(device)
+                style_embs_gt = inputs['style_emb'].to(device)
+                voice_codec = inputs['voice_codec'].to(device)
+                target_codec = target_codec.to(device)
+                
+                style_prompts = inputs['style_prompt']
+                B = phoneme_ids.shape[0]
+                
+                # Convert target codec to audio tokens
+                audio_tokens_3d = target_codec.permute(0, 2, 1).long()
+                audio_tokens = audio_tokens_3d.reshape(B, -1)
                 
                 # Text encoding
-                phoneme_ids, _, text_mask = prepare_text(text_prompts, text_processor, device)
-                text_hidden = text_encoder(phoneme_ids, text_mask)
+                text_hidden = text_encoder(phoneme_ids, mask=phoneme_mask)
                 
-                # Style encoding
+                # Style encoding and loss
                 style_emb = smsd(style_prompts)
                 style_emb = style_emb.to(device)
-                
-                # SMSD loss
                 loss_smsd = smsd(style_prompts, y_true=style_embs_gt)
                 
                 # Duration prediction
-                log_dur_pred = dur_predictor(text_hidden, mask=text_mask)
+                log_dur_pred = dur_predictor(text_hidden, mask=phoneme_mask)
                 
-                # MFA durations REQUIRED
-                assert 'durations' in inputs and inputs['durations'] is not None, \
-                    "MFA durations REQUIRED for validation! Place TextGrid files in VccmDataset/mfa_outputs/"
-                durations_target = inputs['durations'].to(device)
+                durations_target = inputs['durations']
+                if durations_target is not None:
+                    durations_target = durations_target.to(device)
+                    # Handle length mismatch
+                    dur_len = durations_target.shape[1]
+                    ph_len = phoneme_ids.shape[1]
+                    if dur_len != ph_len:
+                        if dur_len < ph_len:
+                            durations_target = F.pad(durations_target, (0, ph_len - dur_len), value=0)
+                        else:
+                            durations_target = durations_target[:, :ph_len]
+                    loss_dur = dur_predictor.compute_loss(log_dur_pred, durations_target, mask=phoneme_mask)
+                else:
+                    loss_dur = torch.tensor(0.0, device=device)
                 
-                loss_dur = dur_predictor.compute_loss(log_dur_pred, durations_target, mask=text_mask)
                 durations_for_lr = torch.exp(log_dur_pred).detach()
                 
                 # Style conditioning
                 styled_frames, frame_lengths, _, _ = style_pipe(
-                    text_hidden, style_emb, durations_for_lr, text_mask=text_mask
+                    text_hidden, style_emb, durations_for_lr, text_mask=phoneme_mask
                 )
                 
                 max_frame = styled_frames.shape[1]
                 frame_mask = torch.arange(max_frame, device=device)[None, :].expand(B, -1) < frame_lengths[:, None]
                 
                 # Voice reference
-                voice_codec, _ = encode_waveforms_to_facodec(inputs["voice_waveform"], codec_encoder)
-                voice_codec = voice_codec.to(device).long()
-                voice_tokens_3d = voice_codec.permute(0, 2, 1)
+                voice_tokens_3d = voice_codec.permute(0, 2, 1).long()
                 ref_hidden, voice_mask = embed_codec_tokens(voice_tokens_3d, decoder)
                 
                 # Decoder
@@ -547,9 +547,18 @@ def validate(
                 total_loss_smsd += loss_smsd.item()
                 num_batches += 1
                 
+                # Update progress bar
+                pbar.set_postfix({
+                    'codec': f'{loss_codec.item():.3f}',
+                    'dur': f'{loss_dur.item():.3f}',
+                    'smsd': f'{loss_smsd.item():.3f}'
+                })
+                
             except Exception as e:
-                print(f"Warning: Validation batch {batch_idx} failed: {e}")
+                print(f"\nWarning: Validation batch {batch_idx} failed: {e}")
                 continue
+        
+        pbar.close()
     
     # Set back to train mode
     text_encoder.train()
@@ -649,17 +658,22 @@ def main():
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     print(f"Checkpoint directory: {checkpoint_dir}")
 
-    # Build models
-    text_processor, text_encoder, dur_predictor, smsd, style_pipe, decoder, codec_encoder = build_models(config, device)
+    # Build models (no FACodec encoder needed - we use preprocessed tensors)
+    text_processor, text_encoder, dur_predictor, smsd, style_pipe, decoder = build_models(config, device)
 
-    # Setup dataset and dataloader with train/val split
-    full_    dataset = VccmTTSDataset(
-        csv_path=config.data.csv_path,
-        audio_root=config.data.audio_root,
-        sample_rate=SAMPLE_RATE,  # FACodec requires 16kHz
+    # Setup dataset using preprocessed tensors
+    print("\n" + "=" * 60)
+    print("Loading dataset...")
+    print("=" * 60)
+    full_dataset = PreprocessedTTSDataset(
+        processed_dir=config.data.processed_dir,
+        mfa_root=config.data.mfa_root,
+        require_mfa=config.data.require_mfa,
+        sample_rate=SAMPLE_RATE,
     )
     
     # Split into train and validation
+    print("\nSplitting dataset...", end=" ", flush=True)
     if config.data.validation_split > 0:
         val_size = int(len(full_dataset) * config.data.validation_split)
         train_size = len(full_dataset) - val_size
@@ -668,12 +682,13 @@ def main():
             [train_size, val_size],
             generator=torch.Generator().manual_seed(config.training.seed)
         )
-        print(f"Dataset split: {train_size} train, {val_size} validation samples")
+        print(f"✓ ({train_size:,} train, {val_size:,} validation)")
     else:
         train_dataset = full_dataset
         val_dataset = None
-        print(f"No validation split - using all {len(full_dataset)} samples for training")
+        print(f"✓ (all {len(full_dataset):,} samples for training, no validation)")
     
+    print("Creating data loaders...", end=" ", flush=True)
     loader = DataLoader(
         train_dataset,
         batch_size=config.training.batch_size,
@@ -693,6 +708,8 @@ def main():
             pin_memory=config.data.pin_memory,
             collate_fn=full_dataset.collate_fn,
         )
+    print(f"✓ (batch_size={config.training.batch_size}, num_workers={config.data.num_workers})")
+    print("=" * 60)
 
     # Setup optimizer with proper hyperparameters
     optim = torch.optim.Adam(
@@ -738,160 +755,191 @@ def main():
     steps_without_improvement = 0
     early_stop = False
     
-    print(f"\nStarting training from step {step} to {config.training.max_steps}")
-    print(f"Best model will be saved to {checkpoint_dir / 'best_model.pt'}")
+    print(f"\n{'=' * 60}")
+    print(f"Starting training from step {step} to {config.training.max_steps}")
+    print(f"{'=' * 60}")
+    print(f"  Best model: {checkpoint_dir / 'best_model.pt'}")
     if config.training.save_last_checkpoint:
-        print(f"Last checkpoint will be saved to {checkpoint_dir / 'last_checkpoint.pt'}")
+        print(f"  Last checkpoint: {checkpoint_dir / 'last_checkpoint.pt'}")
     if config.training.early_stopping_patience > 0:
-        print(f"Early stopping enabled: patience={config.training.early_stopping_patience}, "
+        print(f"  Early stopping: patience={config.training.early_stopping_patience}, "
               f"min_delta={config.training.early_stopping_min_delta}")
-    print(f"Config: lr={config.training.lr}, batch_size={config.training.batch_size}, "
-          f"betas={config.training.betas}, warmup={config.training.warmup_steps}")
+    print(f"  Hyperparameters: lr={config.training.lr}, batch_size={config.training.batch_size}, "
+          f"warmup={config.training.warmup_steps}")
+    print(f"  Logging every {config.training.log_interval} steps, "
+          f"checkpointing every {config.training.save_interval} steps")
+    print(f"{'=' * 60}\n")
     
-    for batch in loader:
-        if step >= config.training.max_steps or early_stop:
-            break
+    # Calculate approximate epochs
+    steps_per_epoch = len(loader)
+    total_epochs = (config.training.max_steps - step) / steps_per_epoch
+    print(f"Dataset: {len(train_dataset)} samples, {steps_per_epoch} batches/epoch, ~{total_epochs:.1f} epochs total\n")
+    
+    # Create progress bar for training
+    pbar = tqdm(
+        total=config.training.max_steps - step,
+        initial=0,
+        desc="Training",
+        unit="step",
+        dynamic_ncols=True,
+    )
+    
+    # Track metrics for progress bar
+    recent_losses = {'codec': [], 'dur': [], 'smsd': [], 'total': []}
+    smoothing_window = 50
+    
+    epoch = 0
+    first_batch = True
+    
+    while step < config.training.max_steps and not early_stop:
+        epoch += 1
+        tqdm.write(f"\n--- Epoch {epoch} starting (step {step}) ---")
+        
+        for batch in loader:
+            if step >= config.training.max_steps or early_stop:
+                break
+            
+            # First batch may be slow due to CUDA kernel compilation
+            if first_batch:
+                tqdm.write("Processing first batch (CUDA compilation may take a moment)...")
+                first_batch = False
 
-        inputs, target_wav = batch  # target_wav: (B, 1, T_audio)
-        text_prompts = inputs["text_prompt"]
-        style_prompts = inputs["style_prompt"]
+            # ============================================================================
+            # Batch format from PreprocessedTTSDataset:
+        #   inputs: dict with phoneme_ids, phoneme_mask, text_prompt, style_prompt,
+        #           style_emb (precomputed), durations, voice_codec
+        #   target_codec: (B, T_target, 6) preprocessed FACodec tokens
+        # ============================================================================
+        inputs, target_codec = batch
+        
+        # Validate batch structure
+        assert isinstance(inputs, dict), f"inputs must be dict, got {type(inputs)}"
+        required_keys = ['phoneme_ids', 'phoneme_mask', 'style_emb', 'voice_codec', 
+                        'text_prompt', 'style_prompt', 'durations']
+        for key in required_keys:
+            assert key in inputs, f"Missing required key '{key}' in batch inputs"
+        
+        # Move tensors to device
+        phoneme_ids = inputs['phoneme_ids'].to(device)           # (B, T_phonemes)
+        phoneme_mask = inputs['phoneme_mask'].to(device)         # (B, T_phonemes) True=pad
+        style_embs_gt = inputs['style_emb'].to(device)           # (B, 512) precomputed
+        voice_codec = inputs['voice_codec'].to(device)           # (B, T_ref, 6)
+        target_codec = target_codec.to(device)                   # (B, T_target, 6)
+        
+        text_prompts = inputs['text_prompt']                     # List[str]
+        style_prompts = inputs['style_prompt']                   # List[str]
+        
+        B = phoneme_ids.shape[0]
+        assert B > 0, "Batch size is 0"
+        
+        # Validate tensor shapes
+        assert phoneme_ids.dim() == 2, f"phoneme_ids should be (B, T), got {phoneme_ids.shape}"
+        assert phoneme_mask.shape == phoneme_ids.shape, \
+            f"phoneme_mask shape {phoneme_mask.shape} != phoneme_ids shape {phoneme_ids.shape}"
+        assert style_embs_gt.shape == (B, 512), f"style_embs_gt should be (B, 512), got {style_embs_gt.shape}"
+        assert voice_codec.dim() == 3 and voice_codec.shape[2] == 6, \
+            f"voice_codec should be (B, T_ref, 6), got {voice_codec.shape}"
+        assert target_codec.dim() == 3 and target_codec.shape[2] == 6, \
+            f"target_codec should be (B, T_target, 6), got {target_codec.shape}"
+        assert len(text_prompts) == B, f"text_prompts length {len(text_prompts)} != batch size {B}"
+        assert len(style_prompts) == B, f"style_prompts length {len(style_prompts)} != batch size {B}"
+        
+        # Convert target codec to audio tokens for decoder
+        # target_codec: (B, T, 6) -> audio_tokens: (B, 6*T)
+        audio_tokens_3d = target_codec.permute(0, 2, 1).long()   # (B, 6, T)
+        audio_tokens = audio_tokens_3d.reshape(B, -1)            # (B, 6*T)
+        pad_id = 0
 
-        # Codec targets
-        with torch.no_grad():
-            codec_tokens, style_embs = encode_waveforms_to_facodec(target_wav, codec_encoder)  # (B, T, C)
-        codec_tokens = codec_tokens.to(device).long()
-        B, T_codec, C = codec_tokens.shape
-        audio_tokens_3d = codec_tokens.permute(0, 2, 1)  # (B, Q, T)
-        audio_tokens = audio_tokens_3d.reshape(B, -1)  # flatten quantizers into one sequence
-        pad_id = 0  # FACodec pads with zeros
-
-        # Text 
-        phoneme_ids, text_mask = prepare_text(text_prompts, text_processor, device)
-        text_hidden = text_encoder(phoneme_ids, mask=text_mask)  # (B, T_text, d_model)
+        # Text encoding using preprocessed phoneme IDs
+        text_hidden = text_encoder(phoneme_ids, mask=phoneme_mask)  # (B, T_text, d_model)
 
         # Style Processing (SMSD module)
         # ============================================================================
-        # ControlSpeech Architecture (Paper Section 3.3):
-        #   SMSD learns to map text descriptions → 512-dim style vectors
-        #
-        # Ground Truth Style Vector Sources (in order of quality):
-        #   1. BEST: Extract prosody features from FACodec encoder + target audio
-        #      - Combines timbre (speaker identity) + prosody (emotion, rate, pitch)
-        #      - This is what ControlSpeech paper uses
-        #
-        #   2. CURRENT: Use FACodec's timbre embeddings (projected to 512-dim)
-        #      - Captures speaker identity well
-        #      - May not fully capture prosodic style variations
-        #      - Good enough for timbre cloning, limited for style transfer
-        #
-        #   3. WORST: Use zero/random vectors (training without style supervision)
-        #      - SMSD learns only from text descriptions
-        #      - Results in poor style controllability
+        # The preprocessed style_emb is the ground truth from FACodec.
+        # SMSD learns to predict this from style text descriptions.
         # ============================================================================
         
-        # Validate style embeddings exist (FACodec should always return them)
-        assert style_embs is not None, "FACodec must return style embeddings - got None"
-        style_embs_gt = style_embs.to(device)
-        
-        # Validate shape
-        assert style_embs_gt.shape == (B, 512), \
-            f"style_embs_gt must be (B, 512), got {style_embs_gt.shape}"
-        
         # Training mode: compute SMSD loss (text description → ground truth style)
-        # The SMSD learns to predict the distribution of style vectors from text
         loss_smsd = smsd(style_prompts, y_true=style_embs_gt)
         assert not torch.isnan(loss_smsd), "SMSD loss is NaN"
         assert not torch.isinf(loss_smsd), "SMSD loss is inf"
         
         # Inference mode: sample style embedding from SMSD's learned distribution
         # NOTE: We use SMSD's sampled output (not ground truth) to match inference behavior
-        # This prevents train/test mismatch where the model never sees its own predictions
         with torch.no_grad():
             style_emb = smsd(style_prompts)
         style_emb = style_emb.to(device)
-        
-        assert style_emb.shape == (B, 512), f"SMSD output must be (B, 512), got {style_emb.shape}"
 
         # Duration Prediction (REQUIRES MFA ALIGNMENTS)
         # ============================================================================
-        # ControlSpeech REQUIRES MFA (Montreal Forced Aligner) durations - NO FALLBACK
-        # 
-        # MFA Setup:
-        #   1. Install: conda install -c conda-forge montreal-forced-aligner
-        #   2. Download models: mfa model download acoustic english_mfa
-        #                       mfa model download dictionary english_mfa
-        #   3. Run alignment: mfa align audio_dir/ transcripts_dir/ english_mfa english_mfa output_dir/
-        #   4. Place TextGrid files in: VccmDataset/mfa_outputs/{item_name}.TextGrid
-        #
-        # The dataset will load durations on-the-fly from TextGrid files.
-        # If TextGrid files are missing, training will FAIL with assertion error.
+        # Durations come from MFA TextGrid files, loaded by PreprocessedTTSDataset.
+        # Dataset is configured with require_mfa=True, so all samples have durations.
         # ============================================================================
-        log_dur_pred = dur_predictor(text_hidden, mask=text_mask)  # (B, T_text)
+        log_dur_pred = dur_predictor(text_hidden, mask=phoneme_mask)  # (B, T_text)
         
-        # text_mask should NEVER be None at this point (prepare_text validates this)
-        assert text_mask is not None, "text_mask is None - this should never happen after prepare_text()"
-        assert text_mask.shape == (B, text_hidden.shape[1]), \
-            f"text_mask shape {text_mask.shape} doesn't match text_hidden (B, T_text)"
+        # MFA durations are REQUIRED - dataset filters samples without them
+        durations_target = inputs['durations']
+        if durations_target is None:
+            raise RuntimeError(
+                "MFA durations are None! This should not happen with require_mfa=True. "
+                "Check your MFA TextGrid files in VccmDataset/mfa_outputs/"
+            )
+        durations_target = durations_target.to(device)
         
-        # MFA durations are REQUIRED - no fallback
-        assert 'durations' in inputs and inputs['durations'] is not None, \
-            "MFA durations are REQUIRED! Run MFA preprocessing and place TextGrid files in VccmDataset/mfa_outputs/"
+        # Handle potential length mismatch between durations and phoneme_ids
+        # (MFA may have different phoneme count than our tokenizer)
+        dur_len = durations_target.shape[1]
+        ph_len = phoneme_ids.shape[1]
+        if dur_len != ph_len:
+            # Log warning for significant mismatches (> 20% difference)
+            mismatch_ratio = abs(dur_len - ph_len) / max(dur_len, ph_len)
+            if mismatch_ratio > 0.2:
+                print(f"WARNING: Large duration/phoneme length mismatch: "
+                      f"dur={dur_len}, ph={ph_len} ({mismatch_ratio:.1%} diff). "
+                      f"This may indicate tokenizer/MFA alignment issues.")
+            
+            # Pad or truncate durations to match phoneme length
+            if dur_len < ph_len:
+                durations_target = F.pad(durations_target, (0, ph_len - dur_len), value=0)
+            else:
+                durations_target = durations_target[:, :ph_len]
         
-        durations_target = inputs['durations'].to(device)
-        assert durations_target.shape == (B, text_hidden.shape[1]), \
-            f"durations shape mismatch: {durations_target.shape} vs text (B, {text_hidden.shape[1]})"
+        assert durations_target.shape == (B, ph_len), \
+            f"Duration shape mismatch after adjustment: {durations_target.shape} vs expected ({B}, {ph_len})"
         
-        loss_dur = dur_predictor.compute_loss(log_dur_pred, durations_target.to(device), mask=text_mask)
+        loss_dur = dur_predictor.compute_loss(log_dur_pred, durations_target, mask=phoneme_mask)
         assert not torch.isnan(loss_dur), "Duration loss is NaN"
         assert not torch.isinf(loss_dur), "Duration loss is inf"
         
         durations_for_lr = torch.exp(log_dur_pred).detach()
-        assert (durations_for_lr >= 0).all(), "Durations must be non-negative"
 
         # Style conditioning + length regulation 
-        # This follows ControlSpeech architecture:
-        # 1. Cross-Attention #1: Text ⊗ Style → styled text
-        # 2. Length Regulation: phoneme → frame level
-        # 3. Cross-Attention #2: Frames ⊗ Style → styled frames
         styled_frames, frame_lengths, style_K, style_V = style_pipe(
-            text_hidden, style_emb, durations_for_lr, text_mask=text_mask
+            text_hidden, style_emb, durations_for_lr, text_mask=phoneme_mask
         )
         # styled_frames: (B, T_frame, d_model) - frame-level, style-conditioned features
+        
+        # Validate style pipeline outputs
+        assert styled_frames.dim() == 3 and styled_frames.shape[0] == B, \
+            f"styled_frames should be (B, T_frame, d_model), got {styled_frames.shape}"
+        assert styled_frames.shape[2] == D_MODEL, \
+            f"styled_frames d_model mismatch: {styled_frames.shape[2]} != {D_MODEL}"
+        assert frame_lengths.shape == (B,), f"frame_lengths should be (B,), got {frame_lengths.shape}"
+        assert (frame_lengths > 0).all(), "All frame_lengths must be positive"
         
         # Create frame-level mask based on actual lengths
         max_frame = styled_frames.shape[1]
         frame_mask = torch.arange(max_frame, device=device)[None, :].expand(B, -1) < frame_lengths[:, None]
-        # frame_mask: (B, T_frame) bool where True=valid, False=padding
 
         # Voice prompt as reference for timbre cloning
-        with torch.no_grad():
-            voice_codec, _ = encode_waveforms_to_facodec(inputs["voice_waveform"], codec_encoder)
-        voice_codec = voice_codec.to(device).long()  # (B, T_ref, C)
-        voice_tokens_3d = voice_codec.permute(0, 2, 1)  # (B, Q, T_ref)
+        # voice_codec is already preprocessed: (B, T_ref, 6)
+        assert voice_codec.shape[0] == B, f"voice_codec batch size mismatch: {voice_codec.shape[0]} != {B}"
+        voice_tokens_3d = voice_codec.permute(0, 2, 1).long()  # (B, 6, T_ref)
+        assert voice_tokens_3d.shape[1] == NUM_QUANTIZERS, \
+            f"voice_codec should have {NUM_QUANTIZERS} quantizers, got {voice_tokens_3d.shape[1]}"
         ref_hidden, voice_mask = embed_codec_tokens(voice_tokens_3d, decoder)
 
-        # Decoder (Codec Generator)
-        # In ControlSpeech, the decoder attends to styled_frames (not raw text_hidden)
-        # These styled_frames already contain:
-        # - Content information (from text)
-        # - Style information (via two cross-attentions)
-        # - Correct temporal structure (via length regulation)
-        
-        # Validate styled_frames shape
-        assert styled_frames.shape == (B, max_frame, text_encoder.d_model), \
-            f"styled_frames shape mismatch: {styled_frames.shape}"
-        
-        # Check for reasonable frame length (not too far off from audio length)
-        audio_frame_count = audio_tokens.shape[1]
-        styled_frame_count = styled_frames.shape[1]
-        ratio = audio_frame_count / styled_frame_count if styled_frame_count > 0 else float('inf')
-        
-        # Warn if mismatch is extreme (more than 2x or less than 0.5x)
-        if ratio > 2.0 or ratio < 0.5:
-            print(f"WARNING: Large mismatch between audio frames ({audio_frame_count}) "
-                  f"and styled frames ({styled_frame_count}), ratio={ratio:.2f}. "
-                  f"This may indicate duration prediction issues.")
-        
+        # Decoder forward pass
         logits = decoder(
             audio_tokens=audio_tokens,
             styled_frames=styled_frames,
@@ -901,8 +949,11 @@ def main():
         )
         
         # Validate decoder output
-        assert logits.shape == (B, audio_tokens.shape[1], decoder.vocab_size_audio), \
-            f"logits shape mismatch: {logits.shape} vs expected (B, {audio_tokens.shape[1]}, {decoder.vocab_size_audio})"
+        expected_logits_shape = (B, audio_tokens.shape[1], VOCAB_SIZE_AUDIO)
+        assert logits.shape == expected_logits_shape, \
+            f"Decoder logits shape mismatch: {logits.shape} != expected {expected_logits_shape}"
+        assert not torch.isnan(logits).any(), "Decoder produced NaN logits"
+        assert not torch.isinf(logits).any(), "Decoder produced Inf logits"
         
         loss_codec = codec_ce_loss(logits, audio_tokens, pad_id=pad_id)
         assert not torch.isnan(loss_codec), "Codec loss is NaN"
@@ -948,14 +999,34 @@ def main():
             # Exponential decay after warmup
             scheduler.step()
         
-        # Logging
+        # Track losses for smoothed progress bar display
+        recent_losses['codec'].append(loss_codec.item())
+        recent_losses['dur'].append(loss_dur.item())
+        recent_losses['smsd'].append(loss_smsd.item())
+        recent_losses['total'].append(loss_total.item())
+        
+        # Keep only recent losses for smoothing
+        for key in recent_losses:
+            if len(recent_losses[key]) > smoothing_window:
+                recent_losses[key] = recent_losses[key][-smoothing_window:]
+        
+        # Update progress bar
+        current_lr = optim.param_groups[0]['lr']
+        avg_loss = sum(recent_losses['total']) / len(recent_losses['total'])
+        pbar.set_postfix({
+            'loss': f'{avg_loss:.3f}',
+            'lr': f'{current_lr:.1e}',
+            'epoch': epoch,
+        })
+        pbar.update(1)
+        
+        # Detailed logging at intervals
         if step % config.training.log_interval == 0:
-            current_lr = optim.param_groups[0]['lr']
-            print(
-                f"step {step:6d} | lr={current_lr:.2e} | "
+            tqdm.write(
+                f"[Step {step:6d}] lr={current_lr:.2e} | "
                 f"loss={loss_total.item():.4f} "
-                f"(codec={loss_codec.item():.4f} "
-                f"dur={loss_dur.item():.4f} "
+                f"(codec={loss_codec.item():.4f}, "
+                f"dur={loss_dur.item():.4f}, "
                 f"smsd={loss_smsd.item():.4f})"
             )
         
@@ -963,35 +1034,35 @@ def main():
         if step % config.training.save_interval == 0 and step > 0:
             # Run validation if available
             if val_loader is not None:
-                print(f"\nRunning validation at step {step}...")
+                tqdm.write(f"\n{'=' * 40}")
+                tqdm.write(f"Running validation at step {step}...")
                 val_metrics = validate(
                     val_loader,
-                    text_processor,
                     text_encoder,
                     dur_predictor,
                     smsd,
                     style_pipe,
                     decoder,
-                    codec_encoder,
                     config,
                     device,
                     max_batches=50,  # Limit validation time
                 )
                 
                 val_loss = val_metrics['val_loss_total']
-                print(f"Validation: loss={val_loss:.4f} "
-                      f"(codec={val_metrics['val_loss_codec']:.4f}, "
-                      f"dur={val_metrics['val_loss_dur']:.4f}, "
-                      f"smsd={val_metrics['val_loss_smsd']:.4f})")
+                tqdm.write(f"Validation: loss={val_loss:.4f} "
+                           f"(codec={val_metrics['val_loss_codec']:.4f}, "
+                           f"dur={val_metrics['val_loss_dur']:.4f}, "
+                           f"smsd={val_metrics['val_loss_smsd']:.4f})")
                 
                 # Check if this is the best model
                 improvement = best_val_loss - val_loss
                 if improvement > config.training.early_stopping_min_delta:
-                    print(f"✓ New best model! (previous: {best_val_loss:.4f}, improvement: {improvement:.4f})")
+                    tqdm.write(f"✓ New best model! (previous: {best_val_loss:.4f}, improvement: {improvement:.4f})")
                     best_val_loss = val_loss
                     steps_without_improvement = 0
                     
                     # Save best model
+                    tqdm.write(f"  Saving best model...")
                     save_checkpoint(
                         "best_model.pt",
                         step,
@@ -1007,19 +1078,22 @@ def main():
                         val_loss=val_loss,
                         extra_info={'val_metrics': val_metrics},
                     )
-                    print(f"  Saved to {checkpoint_dir / 'best_model.pt'}")
+                    tqdm.write(f"  ✓ Saved to {checkpoint_dir / 'best_model.pt'}")
                 else:
                     steps_without_improvement += 1
-                    print(f"  No improvement ({steps_without_improvement}/{config.training.early_stopping_patience})")
+                    tqdm.write(f"  No improvement ({steps_without_improvement}/{config.training.early_stopping_patience})")
                     
                     # Early stopping check
                     if config.training.early_stopping_patience > 0 and \
                        steps_without_improvement >= config.training.early_stopping_patience:
-                        print(f"\n⚠ Early stopping triggered! No improvement for {steps_without_improvement} validations.")
+                        tqdm.write(f"\n⚠ Early stopping triggered! No improvement for {steps_without_improvement} validations.")
                         early_stop = True
+                
+                tqdm.write(f"{'=' * 40}\n")
             
             # Save last checkpoint (for recovery)
             if config.training.save_last_checkpoint:
+                tqdm.write(f"  Saving checkpoint...")
                 save_checkpoint(
                     "last_checkpoint.pt",
                     step,
@@ -1034,19 +1108,24 @@ def main():
                     checkpoint_dir,
                     val_loss=val_loss if val_loader else None,
                 )
-                print(f"  Saved last checkpoint to {checkpoint_dir / 'last_checkpoint.pt'}")
+                tqdm.write(f"  ✓ Saved to {checkpoint_dir / 'last_checkpoint.pt'}")
         
         step += 1
     
+    # Close progress bar
+    pbar.close()
+    
     # Training finished
+    print("\n")
     if early_stop:
-        print(f"\n✓ Training stopped early at step {step} (early stopping triggered)")
+        print(f"✓ Training stopped early at step {step} (early stopping triggered)")
     else:
-        print(f"\n✓ Training completed after {step} steps!")
+        print(f"✓ Training completed after {step} steps!")
     
     print(f"\n{'='*60}")
     print(f"Training Summary:")
     print(f"  Final step: {step}")
+    print(f"  Epochs completed: {epoch}")
     if val_loader:
         print(f"  Best validation loss: {best_val_loss:.4f}")
         print(f"  Best model saved to: {checkpoint_dir / 'best_model.pt'}")

@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 from mamba_ssm import Mamba
+from mamba_ssm.utils.generation import InferenceParams
 
 
 """Mamba-based TTS decoder module.
@@ -9,12 +10,9 @@ from mamba_ssm import Mamba
 Architecture: Replaces ControlSpeech's Transformer decoder with MAVE's Mamba decoder
 
 From MAVE paper (arXiv:2510.04738):
-- `Mamba(d_model)` constructs a layer-like callable.
-- Calling signature: `out, new_state = mamba(x)` for full-sequence or
-    `out, new_state = mamba(x, state)` for step-wise updates.
-- `x` has shape (B, T, d_model) and `out` has same shape; `new_state` is an
-    opaque per-layer state that can be stored and passed back for incremental
-    decoding. The decoder below relies on those semantics.
+- `Mamba(d_model)` constructs a layer-like callable
+- Uses mamba_ssm's InferenceParams for stateful autoregressive decoding
+- `x` has shape (B, T, d_model) and `out` has same shape
 
 Layer Structure (per MAVE):
 - Mamba SSM: Efficient sequence modeling (O(n) vs Transformer's O(n²))
@@ -28,17 +26,19 @@ Inputs (per ControlSpeech + MAVE):
 
 This file includes:
 - `MambaTTSDecoderLayer` : single layer (Mamba + cross-attn + FFN)
-- `MambaTTSDecoder` : stacked decoder with utilities for full-sequence and
-    single-step (autoregressive) decoding. Use `decode_step` for single-token
-    generation (it manages per-layer Mamba states and positional indexing).
+- `MambaTTSDecoder` : stacked decoder with:
+    - forward(): Full-sequence processing for training
+    - create_inference_params(): Initialize state for generation
+    - decode_step(): Single-token generation with InferenceParams state management
 """
 
 
 class MambaTTSDecoderLayer(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff):
+    def __init__(self, d_model, n_heads, d_ff, layer_idx=None):
         super().__init__()
         self.norm_mamba = nn.LayerNorm(d_model)
-        self.mamba = Mamba(d_model)
+        # layer_idx is required for proper state management during inference
+        self.mamba = Mamba(d_model, layer_idx=layer_idx)
 
         self.norm_cross = nn.LayerNorm(d_model)
         self.cross_attn = nn.MultiheadAttention(
@@ -59,21 +59,20 @@ class MambaTTSDecoderLayer(nn.Module):
         x,
         styled_frames,
         styled_mask=None,
-        mamba_state=None,
+        inference_params=None,
     ):
         """
         Args:
             x: (B, T, d_model) - decoder input (embedded audio tokens)
             styled_frames: (B, T_frame, d_model) - style-conditioned frames from pipeline
             styled_mask: (B, T_frame) - mask for styled_frames (True=valid, False=pad)
-            mamba_state: Optional Mamba state for autoregressive decoding
+            inference_params: Optional InferenceParams for autoregressive decoding
+                              (state is managed internally by mamba_ssm)
         """
         # 1) Mamba: main sequence modeling
+        # mamba_ssm.Mamba returns just output tensor; state is managed via inference_params
         h = self.norm_mamba(x)
-        if mamba_state is None:
-            h_mamba, new_state = self.mamba(h)
-        else:
-            h_mamba, new_state = self.mamba(h, mamba_state)
+        h_mamba = self.mamba(h, inference_params=inference_params)
         x = x + h_mamba
 
         # 2) Cross-attention to styled frames (contains content+style+timing)
@@ -96,7 +95,7 @@ class MambaTTSDecoderLayer(nn.Module):
         ff_out = self.ff(h)
         x = x + ff_out
 
-        return x, new_state
+        return x
 
 
 class MambaTTSDecoder(nn.Module):
@@ -119,9 +118,10 @@ class MambaTTSDecoder(nn.Module):
         # Helps distinguish between prosody/content/residual quantizers
         self.quant_embed = nn.Embedding(num_quantizers, d_model)
 
+        self.n_layers = n_layers
         self.layers = nn.ModuleList([
-            MambaTTSDecoderLayer(d_model, n_heads, d_ff)
-            for _ in range(n_layers)
+            MambaTTSDecoderLayer(d_model, n_heads, d_ff, layer_idx=i)
+            for i in range(n_layers)
         ])
 
         self.norm_out = nn.LayerNorm(d_model)
@@ -195,25 +195,49 @@ class MambaTTSDecoder(nn.Module):
         pos = self.pos_embed(pos_ids)[None, :, :].expand(B, T, -1)
         x = tok + pos + qemb
 
-        mamba_states = [None] * len(self.layers)
-        for i, layer in enumerate(self.layers):
-            x, new_state = layer(
+        # Training: no inference_params needed, process full sequence
+        for layer in self.layers:
+            x = layer(
                 x=x,
                 styled_frames=conditioning_frames,
                 styled_mask=conditioning_mask,
-                mamba_state=mamba_states[i],
             )
-            mamba_states[i] = new_state
 
         x = self.norm_out(x)
         logits = self.head(x)
         return logits
 
+    def create_inference_params(self, max_seqlen: int, batch_size: int):
+        """Create InferenceParams for autoregressive decoding.
+        
+        Call this once before starting generation, then pass the same
+        inference_params to each decode_step call.
+        
+        Args:
+            max_seqlen: Maximum sequence length for generation
+            batch_size: Batch size
+            
+        Returns:
+            InferenceParams object to pass to decode_step
+        """
+        inference_params = InferenceParams(
+            max_seqlen=max_seqlen,
+            max_batch_size=batch_size,
+        )
+        # Allocate KV cache for each Mamba layer
+        for layer in self.layers:
+            layer.mamba.allocate_inference_cache(
+                batch_size=batch_size,
+                max_seqlen=max_seqlen,
+                dtype=next(self.parameters()).dtype,
+            )
+        return inference_params
+
     def decode_step(
         self,
         last_token,
         styled_frames,
-        mamba_states,
+        inference_params,
         step_index: int,
         styled_mask=None,
         ref_hidden=None,
@@ -224,8 +248,8 @@ class MambaTTSDecoder(nn.Module):
         Args:
             last_token: (B, 1) int tensor containing the most recent audio token.
             styled_frames: (B, T_frame, d_model) - style-conditioned frames from pipeline.
-            mamba_states: list of per-layer states (length == n_layers). Each
-                entry may be None for the first step.
+            inference_params: InferenceParams object from create_inference_params().
+                              Manages state internally across calls.
             step_index: int, absolute position index of this token (0-based).
             styled_mask: optional (B, T_frame) boolean mask for styled_frames padding.
             ref_hidden: optional (B, T_ref, d_model) - voice prompt embeddings.
@@ -233,10 +257,12 @@ class MambaTTSDecoder(nn.Module):
 
         Returns:
             logits: (B, 1, vocab_size_audio)
-            new_states: list of updated per-layer mamba states
         """
         B_local = last_token.shape[0]
         device = last_token.device
+
+        # Update sequence length in inference_params
+        inference_params.seqlen_offset = step_index
 
         # embed token and position
         tok = self.token_embed(last_token)
@@ -265,16 +291,14 @@ class MambaTTSDecoder(nn.Module):
             else:
                 conditioning_mask = torch.cat([ref_mask, conditioning_mask], dim=1)
 
-        new_states = [None] * len(self.layers)
-        for i, layer in enumerate(self.layers):
-            x, new_state = layer(
+        for layer in self.layers:
+            x = layer(
                 x=x,
                 styled_frames=conditioning_frames,
                 styled_mask=conditioning_mask,
-                mamba_state=mamba_states[i] if mamba_states is not None else None,
+                inference_params=inference_params,
             )
-            new_states[i] = new_state
 
         x = self.norm_out(x)
         logits = self.head(x)
-        return logits, new_states
+        return logits

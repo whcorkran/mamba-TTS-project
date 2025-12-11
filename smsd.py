@@ -322,7 +322,7 @@ def mixture_nll_loss(y_true, pi, mu, sigma, variance_mode="isotropic_across_clus
         # log N(y | mu, sigma^2 I) = -d/2 log(2π) - d/2 log(sigma^2) - 1/(2sigma^2) ||y - mu||^2
         log_prob_components = (
             -0.5 * d * math.log(2 * math.pi)
-            - 0.5 * d * torch.log(variance.squeeze(-1).squeeze(-1))  # (B,) -> broadcast
+            - 0.5 * d * torch.log(sigma).unsqueeze(-1)  # (B, 1) -> broadcasts to (B, K)
             - 0.5 * (diff ** 2).sum(dim=-1) / variance.squeeze(-1)  # (B, K)
         )
     

@@ -266,9 +266,19 @@ class BatchedAudioEncoder:
         
         return audio_batch, valid_indices
     
-    def _encode_on_gpu(self, audio_batch: torch.Tensor, valid_indices: List[int]) -> Dict[int, np.ndarray]:
-        """Run FACodec encoding on GPU. Returns dict mapping global_idx -> codec array."""
-        results = {}
+    def _encode_on_gpu(self, audio_batch: torch.Tensor, valid_indices: List[int]) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray]]:
+        """
+        Run FACodec encoding on GPU.
+        
+        Returns:
+            codec_results: dict mapping global_idx -> codec array (T, 6)
+            style_results: dict mapping global_idx -> style embedding (512,)
+            
+        Per ControlSpeech paper, the ground truth style vector comes from
+        FACodec's speaker embedding, projected from 256 to 512 dimensions.
+        """
+        codec_results = {}
+        style_results = {}
         
         with torch.no_grad():
             enc = self.encoder.fa_encoder(audio_batch)
@@ -287,6 +297,10 @@ class BatchedAudioEncoder:
             vq_pos_emb, vq_id, _, quantized, spk_embs = self.encoder.fa_decoder(
                 enc, prosody, eval_vq=False, vq=True
             )
+            
+            # Project speaker embeddings from 256 to 512 (as per ControlSpeech paper)
+            # This is the ground truth style vector for SMSD training
+            spk_embs_projected = self.encoder.style_projection(spk_embs)  # (B, 256) -> (B, 512)
             
             # Process each sample in batch
             # FACodec V2 ordering: prosody(1) + content(2) + residual(3) = 6 quantizers
@@ -317,25 +331,36 @@ class BatchedAudioEncoder:
                     codec = torch.cat((Ys, Qc), dim=0)  # (6, 1, T)
                     
                     # (6, 1, T) -> (1, T, 6) -> (T, 6)
-                    results[global_idx] = codec.permute(1, 2, 0).squeeze(0).cpu().numpy()
+                    codec_results[global_idx] = codec.permute(1, 2, 0).squeeze(0).cpu().numpy()
+                    
+                    # FACodec speaker embedding projected to 512-dim (ground truth for SMSD)
+                    style_results[global_idx] = spk_embs_projected[j].cpu().numpy()
                 except Exception:
                     continue
         
-        return results
+        return codec_results, style_results
     
     def encode_batch(
         self,
         audio_items: List[Tuple[str, bytes]],  # (path, audio_bytes)
         batch_size: int = 64,
         sr: int = 16000,
-    ) -> List[Optional[np.ndarray]]:
+    ) -> Tuple[List[Optional[np.ndarray]], List[Optional[np.ndarray]]]:
         """
         Encode audio with parallel file loading.
         
         Uses ThreadPoolExecutor to load all files in a batch simultaneously,
         then runs GPU encoding. Simple and effective.
+        
+        Returns:
+            codec_results: List of codec arrays (T, 6) or None
+            style_results: List of style embeddings (512,) or None
+            
+        Per ControlSpeech paper, style embeddings are FACodec speaker embeddings
+        projected to 512 dimensions - these are the ground truth for SMSD training.
         """
-        results = [None] * len(audio_items)
+        codec_results = [None] * len(audio_items)
+        style_results = [None] * len(audio_items)
         num_batches = (len(audio_items) + batch_size - 1) // batch_size
         
         # Single executor reused across all batches
@@ -353,14 +378,16 @@ class BatchedAudioEncoder:
                 if audio_batch is None:
                     continue
                 
-                # GPU encode
-                batch_results = self._encode_on_gpu(audio_batch, valid_indices)
+                # GPU encode - now returns both codec and style
+                batch_codec, batch_style = self._encode_on_gpu(audio_batch, valid_indices)
                 
                 # Store results
-                for global_idx, codec in batch_results.items():
-                    results[global_idx] = codec
+                for global_idx, codec in batch_codec.items():
+                    codec_results[global_idx] = codec
+                for global_idx, style in batch_style.items():
+                    style_results[global_idx] = style
         
-        return results
+        return codec_results, style_results
 
 
 # =============================================================================
@@ -626,16 +653,19 @@ class ParallelDatasetPreprocessor:
         1. Load CSV and prepare work items
         2. Process text to phonemes (multiprocessing)
         3. Extract audio bytes (can be parallelized)
-        4. Batch style embeddings (GPU)
-        5. Batch audio encoding (GPU)
-        6. Async write to disk
+        4. Batch audio encoding + style extraction (GPU) - FACodec provides both
+        5. Async write to disk
+        
+        NOTE: Style embeddings come from FACodec speaker embeddings (projected to 512-dim),
+        NOT from BERT. Per ControlSpeech paper, these are the ground truth style vectors
+        for training the SMSD module. SMSD uses its own BERT internally during training.
         """
         print(f"\n{'='*60}")
         print("Starting parallel preprocessing")
         print(f"{'='*60}")
         
         # Stage 1: Load CSV
-        print("\n[1/6] Loading CSV...")
+        print("\n[1/5] Loading CSV...")
         with open(csv_path, 'r', encoding='utf-8') as f:
             rows = list(csv.DictReader(f))
         
@@ -644,34 +674,30 @@ class ParallelDatasetPreprocessor:
         print(f"  {len(rows)} rows to process")
         
         # Stage 2: Parallel text processing
-        print(f"\n[2/6] Text processing ({self.num_cpu_workers} workers)...")
+        print(f"\n[2/5] Text processing ({self.num_cpu_workers} workers)...")
         text_results = process_text_parallel(
             rows, self.phoneme_to_idx, num_workers=self.num_cpu_workers
         )
         
         # Stage 3: Extract audio bytes
-        print("\n[3/6] Extracting audio from tarball...")
+        print("\n[3/5] Extracting audio from tarball...")
         audio_items = []  # (path, bytes)
         for row in tqdm(rows, desc="Audio extraction"):
             path = self.item_name_to_path(row['item_name'])
             audio_bytes = self.extract_audio_bytes(path)
             audio_items.append((path, audio_bytes))
         
-        # Stage 4: Batch style embeddings
-        print(f"\n[4/6] Computing style embeddings (batch_size={self.gpu_batch_size})...")
-        style_prompts = [row['style_prompt'] for row in rows]
-        style_embeddings = self.style_processor.embed_batch(
-            style_prompts, batch_size=self.gpu_batch_size
-        )
-        
-        # Stage 5: Batch audio encoding with parallel loading
-        print(f"\n[5/6] Encoding audio (batch_size={self.gpu_batch_size}, parallel loading)...")
-        audio_codes = self.audio_encoder.encode_batch(
+        # Stage 4: Batch audio encoding + style extraction (FACodec provides both)
+        # Per ControlSpeech paper: style embeddings are FACodec speaker embeddings
+        # projected from 256 to 512 dimensions - ground truth for SMSD training
+        print(f"\n[4/5] Encoding audio + extracting style (batch_size={self.gpu_batch_size})...")
+        print("       Style embeddings: FACodec speaker embedding (512-dim)")
+        audio_codes, style_embeddings = self.audio_encoder.encode_batch(
             audio_items, batch_size=self.gpu_batch_size, sr=self.sample_rate
         )
         
-        # Stage 6: Async write to disk
-        print(f"\n[6/6] Writing to disk ({self.io_workers} I/O workers)...")
+        # Stage 5: Async write to disk
+        print(f"\n[5/5] Writing to disk ({self.io_workers} I/O workers)...")
         writer = AsyncTensorWriter(self.output_dir, max_workers=self.io_workers)
         all_metadata = []
         processed = 0
@@ -682,7 +708,8 @@ class ParallelDatasetPreprocessor:
             style_emb = style_embeddings[i]
             audio_data = audio_codes[i]
             
-            if text_data is None or audio_data is None:
+            # Need all three: text, style (from FACodec), and audio codec
+            if text_data is None or audio_data is None or style_emb is None:
                 skipped += 1
                 continue
             
@@ -690,7 +717,7 @@ class ParallelDatasetPreprocessor:
             writer.submit(
                 row['item_name'],
                 text_data['phoneme_ids'],
-                style_emb,
+                style_emb,  # FACodec speaker embedding (512-dim), NOT BERT
                 audio_data
             )
             

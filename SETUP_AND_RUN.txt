@@ -53,7 +53,7 @@ python train.py --config config.yaml
 python train.py --config config.yaml --resume checkpoints/last_checkpoint.pt
 
 ================================================================================
-Dataset Summary (after setup.sh completes):
+Dataset Summary (after preprocessing completes):
 ================================================================================
 - Total audio files: ~418k WAV files
 - Samples with transcripts: ~289k (matches CSV entries)
@@ -61,7 +61,20 @@ Dataset Summary (after setup.sh completes):
 - LibriTTS (non-emotional): ~247k samples
 - Total download size: ~90GB
 - Extracted size: ~110GB
+
+Preprocessed Output (processed_data/):
+- metadata.json: 633 MB (289,104 samples)
+- tensors/: 17 GB (867,312 files = 3 per sample)
+  - {item_name}_phonemes.pt: Phoneme token IDs
+  - {item_name}_style.pt: 512-dim BERT style embeddings
+  - {item_name}_codec.pt: FACodec tokens (T, 6)
+
+MFA Alignments (VccmDataset/mfa_outputs/):
+- 288,775 TextGrid files in nested directory structure
+- Training automatically loads durations from TextGrids
+- Samples without matching TextGrids are skipped (require_mfa=true in config)
 ================================================================================
-NOTE: MFA alignments are REQUIRED. Training will fail with assertion error
-if TextGrid files are not found in VccmDataset/mfa_outputs/
+NOTE: Training uses preprocessed tensors (no on-the-fly FACodec encoding).
+This is much faster than the original approach. MFA alignments are still
+loaded on-the-fly from TextGrid files during training.
 ================================================================================

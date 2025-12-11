@@ -3,7 +3,7 @@
 
 # Training hyperparameters
 training:
-  batch_size: 32  # Increased from 10 (baseline uses 16-64)
+  batch_size: 4  # Reduced from 32 due to OOM (long sequences: 6144 tokens)
   max_steps: 400000  # Full training (use 10 for sanity check)
   
   # Optimizer settings (from baseline configs)
@@ -40,6 +40,12 @@ training:
 # Model architecture - CONFIGURABLE hyperparameters only
 # (Architecture constants are hardcoded in code)
 model:
+  # These are defined as constants in train.py but referenced here for documentation
+  d_model: 512
+  d_style: 512
+  vocab_size_audio: 1024
+  num_quantizers: 6
+  
   # Text Encoder (FastSpeech2-style FFT blocks)
   text_encoder:
     n_layers: 4  # Number of FFT blocks (baseline: 4, can experiment)
@@ -64,18 +70,22 @@ model:
     n_layers: 6  # Number of Mamba layers (per ControlSpeech Appendix F: 6)
     max_len: 8192  # Max sequence length for positional encoding
 
-# Data configuration
+# Data configuration - Uses PREPROCESSED tensors from processed_data/
 data:
-  # Dataset paths
-  csv_path: "VccmDataset/controlspeech_train.csv"
-  audio_root: "VccmDataset/TextrolSpeech_data.tar.gz"
+  # Preprocessed data directory (from preprocess_parallel.py output)
+  processed_dir: "processed_data"
+  
+  # MFA alignments directory (nested structure with TextGrid files)
+  mfa_root: "VccmDataset/mfa_outputs"
+  
+  # Whether to require MFA alignments (skip samples without them)
+  require_mfa: true
   
   # Validation split (for best model selection and early stopping)
-  validation_csv: null  # Optional separate validation CSV (null = use train split)
-  validation_split: 0.01  # If no validation_csv, use this fraction of training data (1% = ~100 samples)
+  validation_split: 0.01  # Use 1% of data for validation (~2,890 samples)
   
   # DataLoader settings
-  num_workers: 0  # Number of data loading workers (0 for debugging)
+  num_workers: 4  # Number of data loading workers
   shuffle: true
   pin_memory: true
 
@@ -85,4 +95,3 @@ paths:
   checkpoint_dir: "checkpoints"
   log_dir: "logs"
   output_dir: "outputs"
-
