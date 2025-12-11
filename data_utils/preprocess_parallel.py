@@ -8,7 +8,17 @@ Key optimizations:
 3. ThreadPoolExecutor for async file I/O
 4. Pipeline parallelism: overlap CPU and GPU work
 
-Example usage:
+Example usage (recommended - using extracted audio directory):
+    python -m data_utils.preprocess_parallel \\
+        --csv_path VccmDataset/controlspeech_train.csv \\
+        --output_dir processed_data/ \\
+        --audio_dir VccmDataset/audio_extracted \\
+        --phoneme_vocab_path . \\
+        --cpu_workers 6 \\
+        --gpu_batch_size 16 \\
+        --io_workers 4
+
+Alternative (slower - using tarball):
     python -m data_utils.preprocess_parallel \\
         --csv_path VccmDataset/controlspeech_train.csv \\
         --output_dir processed_data/ \\
@@ -149,8 +159,9 @@ class BatchedStyleProcessor:
             List of numpy arrays (style embeddings)
         """
         results = []
+        num_batches = (len(style_prompts) + batch_size - 1) // batch_size
         
-        for i in range(0, len(style_prompts), batch_size):
+        for i in tqdm(range(0, len(style_prompts), batch_size), total=num_batches, desc="Style embeddings"):
             batch = style_prompts[i:i + batch_size]
             
             # Preprocess all prompts
@@ -175,115 +186,179 @@ class BatchedStyleProcessor:
 
 
 class BatchedAudioEncoder:
-    """FACodec encoder with batched inference."""
+    """FACodec encoder with batched inference and prefetching for high GPU utilization."""
     
-    def __init__(self, max_seq_len: int = 1024, device: str = 'cuda'):
+    def __init__(self, max_seq_len: int = 1024, device: str = 'cuda', num_load_workers: int = 64):
         self.max_seq_len = max_seq_len
         self.encoder = FACodecEncoder(max_seq_len=max_seq_len)
         self.encoder.fa_encoder = self.encoder.fa_encoder.to(device)
         self.encoder.fa_decoder = self.encoder.fa_decoder.to(device)
         self.device = device
+        self.num_load_workers = num_load_workers
+        
+        # Import here to avoid issues in worker processes
+        import io
+        import soundfile as sf
+        import torchaudio
+        self._io = io
+        self._sf = sf
+        self._torchaudio = torchaudio
+    
+    def _load_single_audio(self, args: Tuple[int, str, bytes, int]) -> Tuple[int, Optional[torch.Tensor]]:
+        """Load and preprocess a single audio file. Used by ThreadPoolExecutor."""
+        idx, path, audio_bytes, sr = args
+        try:
+            if audio_bytes is None:
+                return idx, None
+            
+            audio_data, orig_sr = self._sf.read(self._io.BytesIO(audio_bytes))
+            audio = torch.from_numpy(audio_data).float()
+            
+            if audio.ndim == 2:  # stereo -> mono
+                audio = audio.mean(dim=1)
+            
+            if orig_sr != sr:
+                audio = self._torchaudio.functional.resample(
+                    audio.unsqueeze(0), orig_sr, sr
+                ).squeeze(0)
+            
+            return idx, audio
+        except Exception:
+            return idx, None
+    
+    def _prepare_batch(
+        self, 
+        batch_items: List[Tuple[str, bytes]], 
+        batch_indices: List[int],
+        sr: int,
+        executor: ThreadPoolExecutor,
+    ) -> Tuple[Optional[torch.Tensor], List[int]]:
+        """
+        Prepare a batch by loading audio files in parallel.
+        
+        Returns:
+            (audio_batch tensor on GPU, list of valid global indices) or (None, [])
+        """
+        # Submit all load tasks in parallel
+        load_args = [(j, path, audio_bytes, sr) for j, (path, audio_bytes) in enumerate(batch_items)]
+        futures = [executor.submit(self._load_single_audio, args) for args in load_args]
+        
+        # Collect results
+        audio_tensors = []
+        valid_indices = []
+        for future in futures:
+            local_idx, audio = future.result()
+            if audio is not None:
+                audio_tensors.append(audio)
+                valid_indices.append(batch_indices[local_idx])
+        
+        if not audio_tensors:
+            return None, []
+        
+        # Pad to same length and batch
+        max_len = max(t.shape[0] for t in audio_tensors)
+        padded = [
+            torch.nn.functional.pad(t, (0, max_len - t.shape[0]))
+            for t in audio_tensors
+        ]
+        # Stack and move to GPU
+        audio_batch = torch.stack(padded, dim=0).unsqueeze(1).to(self.device)  # (B, 1, T)
+        
+        return audio_batch, valid_indices
+    
+    def _encode_on_gpu(self, audio_batch: torch.Tensor, valid_indices: List[int]) -> Dict[int, np.ndarray]:
+        """Run FACodec encoding on GPU. Returns dict mapping global_idx -> codec array."""
+        results = {}
+        
+        with torch.no_grad():
+            enc = self.encoder.fa_encoder(audio_batch)
+            
+            # V2 API requires prosody features
+            prosody = self.encoder.fa_encoder.get_prosody_feature(audio_batch)
+            
+            # Align prosody length to match enc length (they can differ by 1 frame)
+            if prosody.shape[2] != enc.shape[2]:
+                if prosody.shape[2] > enc.shape[2]:
+                    prosody = prosody[:, :, :enc.shape[2]]
+                else:
+                    pad_len = enc.shape[2] - prosody.shape[2]
+                    prosody = torch.nn.functional.pad(prosody, (0, pad_len))
+            
+            vq_pos_emb, vq_id, _, quantized, spk_embs = self.encoder.fa_decoder(
+                enc, prosody, eval_vq=False, vq=True
+            )
+            
+            # Process each sample in batch
+            # FACodec V2 ordering: prosody(1) + content(2) + residual(3) = 6 quantizers
+            for j, global_idx in enumerate(valid_indices):
+                try:
+                    # Extract this sample's codes with correct V2 ordering
+                    Qp = vq_id[:1, j:j+1, :]      # prosody (1, 1, T)
+                    Qc = vq_id[1:3, j:j+1, :]     # content (2, 1, T)
+                    Qr = vq_id[3:, j:j+1, :]      # residual (3, 1, T)
+                    
+                    # Pad/truncate
+                    def pad_or_trunc(q, max_len=self.max_seq_len):
+                        if q.shape[2] > max_len:
+                            return q[:, :, :max_len]
+                        elif q.shape[2] < max_len:
+                            pad_len = max_len - q.shape[2]
+                            return torch.cat([
+                                q, torch.zeros(q.shape[0], q.shape[1], pad_len, device=q.device)
+                            ], dim=2)
+                        return q
+                    
+                    Qc = pad_or_trunc(Qc)
+                    Qp = pad_or_trunc(Qp)
+                    Qr = pad_or_trunc(Qr)
+                    
+                    # Style codec = prosody + residuals (as per ControlSpeech)
+                    Ys = torch.cat((Qp, Qr), dim=0)  # (4, 1, T)
+                    codec = torch.cat((Ys, Qc), dim=0)  # (6, 1, T)
+                    
+                    # (6, 1, T) -> (1, T, 6) -> (T, 6)
+                    results[global_idx] = codec.permute(1, 2, 0).squeeze(0).cpu().numpy()
+                except Exception:
+                    continue
+        
+        return results
     
     def encode_batch(
         self,
         audio_items: List[Tuple[str, bytes]],  # (path, audio_bytes)
-        batch_size: int = 8,
+        batch_size: int = 64,
         sr: int = 16000,
     ) -> List[Optional[np.ndarray]]:
         """
-        Encode multiple audio files in batches.
+        Encode audio with parallel file loading.
         
-        Args:
-            audio_items: List of (path, audio_bytes) tuples
-            batch_size: Batch size for inference
-            sr: Sample rate
-        
-        Returns:
-            List of numpy arrays (codec tokens) or None for failures
+        Uses ThreadPoolExecutor to load all files in a batch simultaneously,
+        then runs GPU encoding. Simple and effective.
         """
-        import io
-        import soundfile as sf
-        import torchaudio
-        
         results = [None] * len(audio_items)
+        num_batches = (len(audio_items) + batch_size - 1) // batch_size
         
-        for i in range(0, len(audio_items), batch_size):
-            batch_items = audio_items[i:i + batch_size]
-            batch_indices = list(range(i, min(i + batch_size, len(audio_items))))
-            
-            # Load and preprocess audio
-            audio_tensors = []
-            valid_indices = []
-            
-            for j, (path, audio_bytes) in enumerate(batch_items):
-                try:
-                    if audio_bytes is None:
-                        continue
-                    
-                    audio_data, orig_sr = sf.read(io.BytesIO(audio_bytes))
-                    audio = torch.from_numpy(audio_data).float()
-                    
-                    if audio.ndim == 2:  # stereo -> mono
-                        audio = audio.mean(dim=1)
-                    
-                    if orig_sr != sr:
-                        audio = torchaudio.functional.resample(
-                            audio.unsqueeze(0), orig_sr, sr
-                        ).squeeze(0)
-                    
-                    audio_tensors.append(audio)
-                    valid_indices.append(batch_indices[j])
-                except Exception:
-                    continue
-            
-            if not audio_tensors:
-                continue
-            
-            # Pad to same length and batch
-            max_len = max(t.shape[0] for t in audio_tensors)
-            padded = [
-                torch.nn.functional.pad(t, (0, max_len - t.shape[0]))
-                for t in audio_tensors
-            ]
-            audio_batch = torch.stack(padded, dim=0).unsqueeze(1).to(self.device)  # (B, 1, T)
-            
-            # Encode batch
-            with torch.no_grad():
-                enc = self.encoder.fa_encoder(audio_batch)
-                vq_pos_emb, vq_id, _, quantized, spk_embs = self.encoder.fa_decoder(
-                    enc, eval_vq=False, vq=True
+        # Single executor reused across all batches
+        with ThreadPoolExecutor(max_workers=self.num_load_workers) as executor:
+            for batch_num in tqdm(range(num_batches), desc="Audio encoding"):
+                i = batch_num * batch_size
+                batch_items = audio_items[i:i + batch_size]
+                batch_indices = list(range(i, min(i + batch_size, len(audio_items))))
+                
+                # Parallel load + prepare batch
+                audio_batch, valid_indices = self._prepare_batch(
+                    batch_items, batch_indices, sr, executor
                 )
                 
-                # Process each sample in batch
-                for j, global_idx in enumerate(valid_indices):
-                    try:
-                        # Extract this sample's codes
-                        Qc = vq_id[0:1, j:j+1, :]
-                        Qp = vq_id[1:2, j:j+1, :]
-                        Qr = vq_id[2:, j:j+1, :]
-                        
-                        # Pad/truncate
-                        def pad_or_trunc(q, max_len=self.max_seq_len):
-                            if q.shape[2] > max_len:
-                                return q[:, :, :max_len]
-                            elif q.shape[2] < max_len:
-                                pad_len = max_len - q.shape[2]
-                                return torch.cat([
-                                    q, torch.zeros(q.shape[0], q.shape[1], pad_len, device=q.device)
-                                ], dim=2)
-                            return q
-                        
-                        Qc = pad_or_trunc(Qc)
-                        Qp = pad_or_trunc(Qp)
-                        Qr = pad_or_trunc(Qr)
-                        
-                        Ys = torch.cat((Qp, Qr), dim=0)
-                        codec = torch.cat((Ys, Qc), dim=0)
-                        
-                        # (5, 1, T) -> (1, T, 5) -> (T, 5)
-                        results[global_idx] = codec.permute(1, 2, 0).squeeze(0).cpu().numpy()
-                    except Exception:
-                        continue
+                if audio_batch is None:
+                    continue
+                
+                # GPU encode
+                batch_results = self._encode_on_gpu(audio_batch, valid_indices)
+                
+                # Store results
+                for global_idx, codec in batch_results.items():
+                    results[global_idx] = codec
         
         return results
 
@@ -356,7 +431,8 @@ class ParallelDatasetPreprocessor:
     def __init__(
         self,
         output_dir: str,
-        tarball_paths: Union[str, List[str]],
+        tarball_paths: Union[str, List[str]] = None,
+        audio_dir: str = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         sample_rate: int = 16000,
         debug: bool = False,
@@ -387,24 +463,63 @@ class ParallelDatasetPreprocessor:
         self.phoneme_to_idx = {ph: idx for idx, ph in enumerate(self.phoneme_vocab)}
         print(f"Loaded phoneme vocabulary ({len(self.phoneme_vocab)} tokens)")
         
-        # Build tarball index
-        if isinstance(tarball_paths, str):
-            tarball_paths = [p.strip() for p in tarball_paths.split(",") if p.strip()]
-        
+        # Audio source: either directory or tarball(s)
+        self.audio_dir = Path(audio_dir) if audio_dir else None
         self.tarballs: List[tarfile.TarFile] = []
-        self.audio_index: Dict[str, Tuple[tarfile.TarFile, tarfile.TarInfo]] = {}
+        # Primary index: relative path -> source (Path or (tar, member))
+        self.audio_index: Dict[str, Union[Path, Tuple[tarfile.TarFile, tarfile.TarInfo]]] = {}
+        # Secondary index: filename -> relative path (for datasets with non-trivial path mapping)
+        self.filename_index: Dict[str, str] = {}
         
-        for tarball_path in tarball_paths:
-            print(f"Indexing tarball: {tarball_path}")
-            tar = tarfile.open(tarball_path, "r:*")
-            self.tarballs.append(tar)
+        if self.audio_dir and self.audio_dir.exists():
+            # Index audio files from directory (much faster)
+            print(f"Indexing audio directory: {self.audio_dir}")
+            audio_count = 0
+            for wav_path in tqdm(self.audio_dir.rglob("*.wav"), desc="Indexing audio files"):
+                # Store relative path from audio_dir as key, full path as value
+                rel_path = str(wav_path.relative_to(self.audio_dir))
+                self.audio_index[rel_path] = wav_path
+                # Also index by filename for flexible lookup
+                filename = wav_path.stem  # filename without extension
+                if filename not in self.filename_index:
+                    self.filename_index[filename] = rel_path
+                audio_count += 1
+            print(f"Indexed {audio_count:,} audio files from directory")
+        elif tarball_paths:
+            # Build tarball index
+            if isinstance(tarball_paths, str):
+                tarball_paths = [p.strip() for p in tarball_paths.split(",") if p.strip()]
             
-            for m in tar.getmembers():
-                if m.isfile() and m.name.endswith(".wav"):
-                    if m.name not in self.audio_index:
-                        self.audio_index[m.name] = (tar, m)
+            for tarball_path in tarball_paths:
+                print(f"Indexing tarball: {tarball_path}")
+                print(f"  (Reading compressed archive - this may take several minutes for large .tar.gz files...)")
+                tar = tarfile.open(tarball_path, "r:*")
+                self.tarballs.append(tar)
+                
+                # For .tar.gz, getmembers() must read entire archive first (no progress possible)
+                # Use iterator approach to show progress during indexing
+                audio_count = 0
+                member_count = 0
+                while True:
+                    m = tar.next()
+                    if m is None:
+                        break
+                    member_count += 1
+                    if member_count % 10000 == 0:
+                        print(f"  Scanned {member_count:,} entries, found {audio_count:,} audio files...")
+                    if m.isfile() and m.name.endswith(".wav"):
+                        if m.name not in self.audio_index:
+                            self.audio_index[m.name] = (tar, m)
+                            # Also index by filename for flexible lookup
+                            filename = Path(m.name).stem
+                            if filename not in self.filename_index:
+                                self.filename_index[filename] = m.name
+                            audio_count += 1
+                print(f"  Done: scanned {member_count:,} entries, indexed {audio_count:,} audio files")
+        else:
+            raise ValueError("Must provide either --audio_dir or --tarball")
         
-        print(f"Indexed {len(self.audio_index)} audio files")
+        print(f"Total indexed: {len(self.audio_index)} audio files")
         
         # Initialize GPU processors (lazy)
         self._style_processor = None
@@ -429,14 +544,75 @@ class ParallelDatasetPreprocessor:
             for tar in self.tarballs:
                 tar.close()
     
-    def item_name_to_path(self, item_name: str) -> str:
-        return str(Path(item_name.replace("-", "/")).with_suffix(".wav"))
+    def item_name_to_path(self, item_name: str) -> Optional[str]:
+        """
+        Convert item_name to audio file path using multiple strategies.
+        
+        Handles various naming conventions:
+        - ESD/MEAD/etc: "Dataset-SubDir-Speaker-Emotion-filename" -> "Dataset/SubDir/Speaker/Emotion/filename.wav"
+        - LibriTTS: "speaker_chapter_seq_subseq" -> lookup by filename
+        - CREMA: "CREMA-D-AudioWAV-filename" -> "CREMA/AudioWAV/filename.wav" (D is part of name, not dir)
+        - RAVDESS: "RAVDESS-Actor_XX-aa-bb-cc-..." -> "RAVDESS/Actor_XX/aa-bb-cc-....wav"
+        """
+        # Strategy 1: Try direct hyphen-to-slash conversion (works for ESD, MEAD, TESS, etc.)
+        direct_path = str(Path(item_name.replace("-", "/")).with_suffix(".wav"))
+        if direct_path in self.audio_index:
+            return direct_path
+        
+        # Strategy 2: Extract filename and look up in filename index
+        # This handles LibriTTS (no hyphens) and mismatched path structures
+        
+        # For items without hyphens (LibriTTS), the whole thing is the filename
+        if "-" not in item_name:
+            filename = item_name
+        else:
+            # For hyphenated names, try to extract the actual filename
+            parts = item_name.split("-")
+            
+            # Special case: RAVDESS - "RAVDESS-Actor_XX-aa-bb-cc-dd-ee-ff-gg"
+            # Filename is everything after "Actor_XX-"
+            if item_name.startswith("RAVDESS-Actor_"):
+                # Find where Actor_XX ends
+                actor_part = parts[1]  # "Actor_04"
+                rest_start = len("RAVDESS-") + len(actor_part) + 1  # +1 for the hyphen
+                filename = item_name[rest_start:]  # "03-01-05-01-02-01-04"
+            
+            # Special case: CREMA-D - "CREMA-D-AudioWAV-filename"
+            # The "D" is part of dataset name, not a directory
+            elif item_name.startswith("CREMA-D-"):
+                filename = parts[-1]  # Last segment is the filename
+            
+            else:
+                # Default: last segment is the filename
+                filename = parts[-1]
+        
+        # Look up in filename index
+        if filename in self.filename_index:
+            return self.filename_index[filename]
+        
+        # Strategy 3: Try without the file extension in case of mismatch
+        filename_no_ext = filename.replace(".wav", "")
+        if filename_no_ext in self.filename_index:
+            return self.filename_index[filename_no_ext]
+        
+        return None
     
-    def extract_audio_bytes(self, wav_path: str) -> Optional[bytes]:
-        """Extract audio bytes from tarball."""
-        if wav_path not in self.audio_index:
+    def extract_audio_bytes(self, wav_path: Optional[str]) -> Optional[bytes]:
+        """Extract audio bytes from tarball or directory."""
+        if wav_path is None or wav_path not in self.audio_index:
             return None
-        tar, member = self.audio_index[wav_path]
+        
+        source = self.audio_index[wav_path]
+        
+        # If source is a Path, read from file
+        if isinstance(source, Path):
+            try:
+                return source.read_bytes()
+            except Exception:
+                return None
+        
+        # Otherwise it's a (tar, member) tuple
+        tar, member = source
         f = tar.extractfile(member)
         if f is None:
             return None
@@ -488,15 +664,11 @@ class ParallelDatasetPreprocessor:
             style_prompts, batch_size=self.gpu_batch_size
         )
         
-        # Stage 5: Batch audio encoding
-        print(f"\n[5/6] Encoding audio (batch_size={self.gpu_batch_size})...")
-        audio_codes = []
-        for i in tqdm(range(0, len(audio_items), self.gpu_batch_size), desc="Audio encoding"):
-            batch = audio_items[i:i + self.gpu_batch_size]
-            batch_results = self.audio_encoder.encode_batch(
-                batch, batch_size=len(batch), sr=self.sample_rate
-            )
-            audio_codes.extend(batch_results)
+        # Stage 5: Batch audio encoding with parallel loading
+        print(f"\n[5/6] Encoding audio (batch_size={self.gpu_batch_size}, parallel loading)...")
+        audio_codes = self.audio_encoder.encode_batch(
+            audio_items, batch_size=self.gpu_batch_size, sr=self.sample_rate
+        )
         
         # Stage 6: Async write to disk
         print(f"\n[6/6] Writing to disk ({self.io_workers} I/O workers)...")
@@ -560,7 +732,8 @@ class ParallelDatasetPreprocessor:
 def preprocess_dataset_parallel(
     csv_path: str,
     output_dir: str,
-    tarball_paths: Union[str, List[str]],
+    tarball_paths: Union[str, List[str]] = None,
+    audio_dir: str = None,
     device: str = None,
     sample_rate: int = 16000,
     debug: bool = False,
@@ -575,6 +748,7 @@ def preprocess_dataset_parallel(
     preprocessor = ParallelDatasetPreprocessor(
         output_dir=output_dir,
         tarball_paths=tarball_paths,
+        audio_dir=audio_dir,
         device=device,
         sample_rate=sample_rate,
         debug=debug,
@@ -590,7 +764,10 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Parallel TTS dataset preprocessing")
     parser.add_argument("--csv_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--tarball", type=str, nargs='+', required=True)
+    parser.add_argument("--audio_dir", type=str, default=None,
+                        help="Directory containing extracted audio files (recommended, faster)")
+    parser.add_argument("--tarball", type=str, nargs='+', default=None,
+                        help="Tarball(s) containing audio files (slower, use --audio_dir if available)")
     parser.add_argument("--phoneme_vocab_path", type=str, default=".")
     parser.add_argument("--sample_rate", type=int, default=16000)
     parser.add_argument("--device", type=str, default=None)
@@ -604,14 +781,19 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     
+    if not args.audio_dir and not args.tarball:
+        parser.error("Must provide either --audio_dir or --tarball")
+    
     tarball_paths = []
-    for path in args.tarball:
-        tarball_paths.extend(p.strip() for p in path.split(",") if p.strip())
+    if args.tarball:
+        for path in args.tarball:
+            tarball_paths.extend(p.strip() for p in path.split(",") if p.strip())
     
     preprocess_dataset_parallel(
         csv_path=args.csv_path,
         output_dir=args.output_dir,
-        tarball_paths=tarball_paths,
+        audio_dir=args.audio_dir,
+        tarball_paths=tarball_paths if tarball_paths else None,
         device=args.device,
         sample_rate=args.sample_rate,
         debug=args.debug,

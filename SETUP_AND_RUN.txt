@@ -2,73 +2,65 @@
 ControlSpeech + Mamba TTS - Setup Commands
 ================================================================================
 
-# 1. Create environment from yml
+# 1. Create conda environment
 conda env create -f environment.yml
 conda activate mambatts
 
-# 2. Install Mamba SSM and textgrid
+# 2. Install additional packages
 pip install mamba-ssm textgrid
 
-# 3. Run setup script (clones repos, downloads dataset)
+# 3. Run setup script (downloads ~90GB, extracts audio, pairs transcripts)
+#    This will take 30-60 minutes depending on internet speed
 bash setup.sh
 
-# 4. Run MFA (REQUIRED - no fallback)
+# 4. Install and run MFA (Montreal Forced Aligner)
 conda install -c conda-forge montreal-forced-aligner
 mfa model download acoustic english_mfa
 mfa model download dictionary english_mfa
 
-# Extract audio for MFA
-mkdir -p VccmDataset/audio_extracted
-cd VccmDataset
-tar -xzf TextrolSpeech_data.tar.gz -C audio_extracted/
-cd ..
-
-# Create transcripts for MFA
-python -c "
-import csv
-from pathlib import Path
-csv_path = 'VccmDataset/controlspeech_train.csv'
-out_dir = Path('VccmDataset/transcripts')
-out_dir.mkdir(exist_ok=True)
-with open(csv_path, 'r', encoding='utf-8') as f:
-    for row in csv.DictReader(f):
-        (out_dir / f\"{row['item_name']}.txt\").write_text(row['txt'])
-"
-
-# Run MFA alignment (this will take 1-4 hours)
-mkdir -p VccmDataset/mfa_outputs
+# Run MFA alignment (this will take several hours for 289k samples)
 mfa align \
     VccmDataset/audio_extracted \
-    VccmDataset/transcripts \
     english_mfa \
     english_mfa \
     VccmDataset/mfa_outputs
 
-# 5. Preprocess dataset (choose one):
+# 5. Preprocess dataset
+#    NOTE: Use --audio_dir (extracted files) instead of --tarball
+#    The tarball only contains ~56k files, but audio_extracted has all 418k files
 
-# Option A: Serial preprocessing
-python -m data_utils.preprocess \
-    --csv_path VccmDataset/controlspeech_train.csv \
-    --output_dir processed_data/ \
-    --tarball VccmDataset/TextrolSpeech_data.tar.gz \
-    --phoneme_vocab_path .
-
-# Option B: Parallel preprocessing (faster)
+# Recommended: Parallel preprocessing (faster)
 python -m data_utils.preprocess_parallel \
     --csv_path VccmDataset/controlspeech_train.csv \
     --output_dir processed_data/ \
-    --tarball VccmDataset/TextrolSpeech_data.tar.gz \
+    --audio_dir VccmDataset/audio_extracted \
     --phoneme_vocab_path . \
     --cpu_workers 6 \
-    --gpu_batch_size 16 \
+    --gpu_batch_size 32 \
     --io_workers 4
 
-# 6. Train (will FAIL if MFA not done)
+# Alternative: Serial preprocessing (slower, simpler)
+python -m data_utils.preprocess \
+    --csv_path VccmDataset/controlspeech_train.csv \
+    --output_dir processed_data/ \
+    --audio_dir VccmDataset/audio_extracted \
+    --phoneme_vocab_path .
+
+# 6. Train
 python train.py --config config.yaml
 
 # 7. Resume training (if interrupted)
 python train.py --config config.yaml --resume checkpoints/last_checkpoint.pt
 
+================================================================================
+Dataset Summary (after setup.sh completes):
+================================================================================
+- Total audio files: ~418k WAV files
+- Samples with transcripts: ~289k (matches CSV entries)
+- Emotional datasets: ESD, MEAD, CREMA-D, TESS, RAVDESS, SAVEE, MESS (~42k)
+- LibriTTS (non-emotional): ~247k samples
+- Total download size: ~90GB
+- Extracted size: ~110GB
 ================================================================================
 NOTE: MFA alignments are REQUIRED. Training will fail with assertion error
 if TextGrid files are not found in VccmDataset/mfa_outputs/

@@ -2,13 +2,21 @@
 Dataset preprocessing pipeline.
 Preprocesses CSV dataset: audio encoding, text-to-phoneme, style embeddings.
 Saves processed data for PyTorch DataLoader.
-"""
 
-#    python -m data_utils.preprocess --csv_path VccmDataset/controlspeech_train.csv \
-#        --output_dir processed_data/ \
-#        --tarball VccmDataset/TextrolSpeech_data.tar.gz \
-#        --phoneme_vocab_path . \
-#        --debug
+Example usage (recommended - using extracted audio directory):
+    python -m data_utils.preprocess \\
+        --csv_path VccmDataset/controlspeech_train.csv \\
+        --output_dir processed_data/ \\
+        --audio_dir VccmDataset/audio_extracted \\
+        --phoneme_vocab_path .
+
+Alternative (slower - using tarball):
+    python -m data_utils.preprocess \\
+        --csv_path VccmDataset/controlspeech_train.csv \\
+        --output_dir processed_data/ \\
+        --tarball VccmDataset/TextrolSpeech_data.tar.gz \\
+        --phoneme_vocab_path .
+"""
 
 import csv
 import json
@@ -31,7 +39,8 @@ class DatasetPreprocessor:
     def __init__(
         self,
         output_dir: str,
-        tarball_paths: Union[str, List[str]],
+        tarball_paths: Union[str, List[str]] = None,
+        audio_dir: str = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         sample_rate: int = 16000,
         debug: bool = False,
@@ -44,6 +53,7 @@ class DatasetPreprocessor:
             output_dir: Directory to save preprocessed data
             tarball_paths: Path(s) to tarball(s) containing audio files.
                            Can be a single path, a list of paths, or comma-separated paths.
+            audio_dir: Directory containing extracted audio files (faster than tarball)
             device: Device for model inference
             sample_rate: Target sample rate for audio
             debug: If True, only process first 128 samples
@@ -66,31 +76,42 @@ class DatasetPreprocessor:
         self.phoneme_to_idx = {ph: idx for idx, ph in enumerate(self.phoneme_vocab)}
         print(f"Loaded phoneme vocabulary ({len(self.phoneme_vocab)} tokens) from {vocab_path}")
         
-        # Normalize tarball_paths to a list
-        if isinstance(tarball_paths, str):
-            # Support comma-separated paths
-            tarball_paths = [p.strip() for p in tarball_paths.split(",") if p.strip()]
-        
-        # Open tarballs and build combined audio index
-        # Maps audio filename -> (tarfile object, TarInfo)
+        # Audio source: either directory or tarball(s)
+        self.audio_dir = Path(audio_dir) if audio_dir else None
         self.tarballs: List[tarfile.TarFile] = []
-        self.audio_index: Dict[str, Tuple[tarfile.TarFile, tarfile.TarInfo]] = {}
+        self.audio_index: Dict[str, Union[Path, Tuple[tarfile.TarFile, tarfile.TarInfo]]] = {}
         
-        for tarball_path in tarball_paths:
-            print(f"Loading audio files: {tarball_path}")
-            tar = tarfile.open(tarball_path, "r:*")
-            self.tarballs.append(tar)
+        if self.audio_dir and self.audio_dir.exists():
+            # Index audio files from directory (much faster)
+            print(f"Indexing audio directory: {self.audio_dir}")
+            audio_count = 0
+            for wav_path in tqdm(self.audio_dir.rglob("*.wav"), desc="Indexing audio files"):
+                rel_path = str(wav_path.relative_to(self.audio_dir))
+                self.audio_index[rel_path] = wav_path
+                audio_count += 1
+            print(f"Indexed {audio_count:,} audio files from directory")
+        elif tarball_paths:
+            # Normalize tarball_paths to a list
+            if isinstance(tarball_paths, str):
+                tarball_paths = [p.strip() for p in tarball_paths.split(",") if p.strip()]
             
-            count = 0
-            for m in tar.getmembers():
-                if m.isfile() and m.name.endswith(".wav"):
-                    if m.name not in self.audio_index:
-                        self.audio_index[m.name] = (tar, m)
-                        count += 1
-                    # If duplicate, first tarball wins (could warn here if needed)
-            print(f"  Found {count} audio files in {Path(tarball_path).name}")
+            for tarball_path in tarball_paths:
+                print(f"Loading audio files: {tarball_path}")
+                tar = tarfile.open(tarball_path, "r:*")
+                self.tarballs.append(tar)
+                
+                count = 0
+                for m in tar.getmembers():
+                    if m.isfile() and m.name.endswith(".wav"):
+                        if m.name not in self.audio_index:
+                            self.audio_index[m.name] = (tar, m)
+                            count += 1
+                print(f"  Found {count} audio files in {Path(tarball_path).name}")
+            print(f"  Total: {len(self.audio_index)} unique audio files across {len(self.tarballs)} tarball(s)")
+        else:
+            raise ValueError("Must provide either --audio_dir or --tarball")
         
-        print(f"  Total: {len(self.audio_index)} unique audio files across {len(self.tarballs)} tarball(s)")
+        print(f"Total indexed: {len(self.audio_index)} audio files")
         
         # Initialize processors
         self.txt_processor = TxtProcessor()
@@ -140,19 +161,28 @@ class DatasetPreprocessor:
     
     def process_audio(self, wav_path: str) -> Tuple[np.ndarray, np.ndarray]:
         try:
-            # Look up file in tarball index
+            # Look up file in audio index
             if wav_path not in self.audio_index:
-                print(f"  Audio not found in tarball: {wav_path}")
+                print(f"  Audio not found: {wav_path}")
                 return None, None
             
-            tar, member = self.audio_index[wav_path]
+            source = self.audio_index[wav_path]
             
-            # Extract audio bytes from tarball
-            f = tar.extractfile(member)
-            if f is None:
-                print(f"  Could not extract: {wav_path}")
-                return None, None
-            audio_bytes = f.read()
+            # If source is a Path, read from file
+            if isinstance(source, Path):
+                try:
+                    audio_bytes = source.read_bytes()
+                except Exception:
+                    print(f"  Could not read: {wav_path}")
+                    return None, None
+            else:
+                # Otherwise it's a (tar, member) tuple
+                tar, member = source
+                f = tar.extractfile(member)
+                if f is None:
+                    print(f"  Could not extract: {wav_path}")
+                    return None, None
+                audio_bytes = f.read()
             
             # Encode with FACodec (pass bytes directly)
             with torch.no_grad():
@@ -308,7 +338,8 @@ class DatasetPreprocessor:
 def preprocess_dataset(
     csv_path: str,
     output_dir: str,
-    tarball_paths: Union[str, List[str]],
+    tarball_paths: Union[str, List[str]] = None,
+    audio_dir: str = None,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     sample_rate: int = 16000,
     debug: bool = False,
@@ -322,6 +353,7 @@ def preprocess_dataset(
         output_dir: Directory to save preprocessed data
         tarball_paths: Path(s) to tarball(s) containing audio files.
                        Can be a single path, a list of paths, or comma-separated paths.
+        audio_dir: Directory containing extracted audio files (faster than tarball)
         device: Device for model inference
         sample_rate: Target sample rate for audio
         debug: If True, only process first 128 samples
@@ -333,6 +365,7 @@ def preprocess_dataset(
     preprocessor = DatasetPreprocessor(
         output_dir=output_dir,
         tarball_paths=tarball_paths,
+        audio_dir=audio_dir,
         device=device,
         sample_rate=sample_rate,
         debug=debug,
@@ -347,10 +380,10 @@ if __name__ == '__main__':
                         help="Path to CSV file")
     parser.add_argument("--output_dir", type=str, required=True, 
                         help="Output directory for preprocessed data")
-    parser.add_argument("--tarball", type=str, nargs='+', required=True, 
-                        help="Path(s) to audio tarball(s). Can specify multiple: "
-                             "--tarball file1.tar file2.tar or use comma-separated: "
-                             "--tarball 'file1.tar,file2.tar'")
+    parser.add_argument("--audio_dir", type=str, default=None,
+                        help="Directory containing extracted audio files (recommended, faster)")
+    parser.add_argument("--tarball", type=str, nargs='+', default=None, 
+                        help="Path(s) to audio tarball(s) (slower, use --audio_dir if available)")
     parser.add_argument("--phoneme_vocab_path", type=str, default=".",
                         help="Path to phoneme_vocab.json or directory containing it (default: '.')")
     parser.add_argument("--sample_rate", type=int, default=16000,
@@ -361,17 +394,22 @@ if __name__ == '__main__':
                         help="Use debug dataset")
     args = parser.parse_args()
     
+    if not args.audio_dir and not args.tarball:
+        parser.error("Must provide either --audio_dir or --tarball")
+    
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     
     # Flatten tarball paths: handle both multiple args and comma-separated
     tarball_paths = []
-    for path in args.tarball:
-        tarball_paths.extend(p.strip() for p in path.split(",") if p.strip())
+    if args.tarball:
+        for path in args.tarball:
+            tarball_paths.extend(p.strip() for p in path.split(",") if p.strip())
     
     preprocess_dataset(
         csv_path=args.csv_path,
         output_dir=args.output_dir,
-        tarball_paths=tarball_paths,
+        audio_dir=args.audio_dir,
+        tarball_paths=tarball_paths if tarball_paths else None,
         device=device,
         sample_rate=args.sample_rate,
         debug=args.debug,
