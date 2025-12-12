@@ -168,7 +168,7 @@ class PreprocessedTTSDataset(Dataset):
             meta = self.all_metadata[idx]
             safe_names_to_load.add(self._safe_name(meta['item_name']))
         
-        # Load all tensors with progress bar
+        # Load all tensors with progress bar (single-threaded for best performance)
         for safe_name in tqdm(safe_names_to_load, desc="Loading tensors into RAM"):
             phoneme_path = tensors_dir / f"{safe_name}_phonemes.pt"
             style_path = tensors_dir / f"{safe_name}_style.pt"

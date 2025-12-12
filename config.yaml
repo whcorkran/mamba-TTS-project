@@ -3,8 +3,9 @@
 
 # Training hyperparameters
 training:
-  batch_size: 16  # Larger batches OOM on long sequences
-  max_steps: 400000  # Full training (use 10 for sanity check)
+  batch_size: 24  # 24 per GPU × 4 GPUs = 96 effective batch
+  gradient_accumulation_steps: 1  # No accumulation (simpler, warmup works correctly)
+  max_steps: 16250  # ~6 epochs: 260k samples / 96 batch × 6 epochs
   
   # Optimizer settings (from baseline configs)
   lr: 0.0002  # 2e-4 (baseline PromptStyle)
@@ -25,8 +26,8 @@ training:
   w_smsd: 0.5  # Style mixture density loss
   
   # Logging and Checkpointing
-  log_interval: 100
-  save_interval: 5000  # Validate and save best model every N steps
+  log_interval: 50
+  save_interval: 1000  # Validate and save best model every N steps (~1 epoch)
   save_last_checkpoint: true  # Keep last checkpoint for crash recovery
   
   # Early Stopping (optional - set patience to 0 to disable)
@@ -84,8 +85,9 @@ data:
   # RAM caching: load ALL tensors into RAM at startup (uses ~16GB, eliminates disk I/O)
   cache_in_ram: true
   
-  # Validation split (for best model selection and early stopping)
-  validation_split: 0.01  # Use 1% of data for validation (~2,890 samples)
+  # Data splits (train/val/test)
+  validation_split: 0.05  # 5% for validation (~14,450 samples)
+  test_split: 0.05  # 5% for test (~14,450 samples) - held out, not used during training
   
   # DataLoader settings
   num_workers: 4  # Balance between prefetching and overhead

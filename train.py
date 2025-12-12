@@ -68,8 +68,9 @@ Architecture Notes:
 """
 
 import argparse
+import os
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 import yaml
 import json
 from datetime import datetime
@@ -79,7 +80,45 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
+
+
+# ============================================================================
+# DISTRIBUTED TRAINING UTILITIES
+# ============================================================================
+def setup_ddp(rank: int, world_size: int):
+    """Initialize the distributed process group for DDP training."""
+    dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
+    torch.cuda.set_device(rank)
+
+def cleanup_ddp():
+    """Clean up the distributed process group"""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def is_main_process() -> bool:
+    """Check if this is the main process (rank 0)"""
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+def get_world_size() -> int:
+    """Get the total number of processes"""
+    return dist.get_world_size() if dist.is_initialized() else 1
+
+def get_rank() -> int:
+    """Get the rank of this process"""
+    return dist.get_rank() if dist.is_initialized() else 0
+
+def print_rank0(*args, **kwargs):
+    """Print only on rank 0"""
+    if is_main_process():
+        print(*args, **kwargs)
+
+def get_module(model: nn.Module) -> nn.Module:
+    """Get the underlying module from a DDP wrapper"""
+    return model.module if isinstance(model, DDP) else model
 
 from dataset import PreprocessedTTSDataset
 from text_encoder import TextProcessor, TextEncoder, DurationPredictor
@@ -268,16 +307,19 @@ def embed_codec_tokens(tokens_3d: torch.Tensor, decoder: MambaTTSDecoder):
     B, Q, T_ref = tokens_3d.shape
     assert Q > 0 and T_ref > 0, f"Invalid quantizer or time dimensions: Q={Q}, T={T_ref}"
     
+    # Unwrap DDP if needed
+    decoder_module = get_module(decoder)
+    
     flat = tokens_3d.reshape(B, Q * T_ref)
     quant_ids = torch.arange(Q, device=flat.device).repeat_interleave(T_ref).unsqueeze(0).expand(B, -1)
     pos_ids = torch.arange(T_ref, device=flat.device).repeat(Q)
-    pos = decoder.pos_embed(pos_ids)[None, :, :].expand(B, -1, -1)
-    tok = decoder.token_embed(flat)
-    qemb = decoder.quant_embed(quant_ids)
+    pos = decoder_module.pos_embed(pos_ids)[None, :, :].expand(B, -1, -1)
+    tok = decoder_module.token_embed(flat)
+    qemb = decoder_module.quant_embed(quant_ids)
     ref_hidden = tok + pos + qemb
 
     # Validate output shapes
-    assert ref_hidden.shape == (B, Q * T_ref, decoder.token_embed.embedding_dim), \
+    assert ref_hidden.shape == (B, Q * T_ref, decoder_module.token_embed.embedding_dim), \
         f"ref_hidden shape mismatch: {ref_hidden.shape}"
 
     # mask: True for padding (token==0)
@@ -323,6 +365,9 @@ def validate_config(config: Config):
     assert config.training.save_interval > 0, "save_interval must be positive"
     assert config.training.early_stopping_patience >= 0, "early_stopping_patience must be non-negative (0 = disabled)"
     assert config.data.validation_split >= 0 and config.data.validation_split < 1, "validation_split must be in [0, 1)"
+    test_split = getattr(config.data, 'test_split', 0)
+    assert test_split >= 0 and test_split < 1, "test_split must be in [0, 1)"
+    assert config.data.validation_split + test_split < 1, "validation_split + test_split must be < 1"
     
     print("✓ Configuration validation passed")
 
@@ -525,7 +570,7 @@ def validate(
                             durations_target = F.pad(durations_target, (0, ph_len - dur_len), value=0)
                         else:
                             durations_target = durations_target[:, :ph_len]
-                    loss_dur = dur_predictor.compute_loss(log_dur_pred, durations_target, mask=phoneme_mask)
+                    loss_dur = get_module(dur_predictor).compute_loss(log_dur_pred, durations_target, mask=phoneme_mask)
                 else:
                     loss_dur = torch.tensor(0.0, device=device)
                 
@@ -643,29 +688,45 @@ def main():
     parser = argparse.ArgumentParser(description="Train ControlSpeech + Mamba TTS")
     parser.add_argument("--config", type=str, default="config.yaml", help="Path to config file")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--local_rank", type=int, default=-1, help="Local rank for DDP (set by torchrun)")
     args = parser.parse_args()
+
+    # ============================================================================
+    # DDP SETUP - Critical for multi-GPU training
+    # ============================================================================
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    rank = int(os.environ.get("RANK", 0))
+    local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank if args.local_rank >= 0 else 0))
+    
+    use_ddp = world_size > 1
+    
+    if use_ddp:
+        setup_ddp(rank, world_size)
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(local_rank)  # Ensure correct GPU
+        print(f"[Rank {rank}/{world_size}] Using GPU {local_rank}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Running in single-process mode on {device}")
 
     # Load configuration
     config = load_config(args.config)
-    print(f"Loaded config from {args.config}")
+    print_rank0(f"Loaded config from {args.config}")
     
     # Validate configuration early to catch errors
-    validate_config(config)
+    if is_main_process():
+        validate_config(config)
+    if use_ddp:
+        dist.barrier()
     
     # Set random seed for reproducibility
-    torch.manual_seed(config.training.seed)
+    seed = config.training.seed + rank
+    torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(config.training.seed)
-        # Enable cuDNN benchmark for faster convolutions
+        torch.cuda.manual_seed(seed)
         torch.backends.cudnn.benchmark = True
 
-    # Setup device
-    if config.training.device == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available, falling back to CPU")
-        device = torch.device("cpu")
-    else:
-        device = torch.device(config.training.device)
-    print(f"Using device: {device}")
+    print_rank0(f"Using device: {device}")
 
     # Setup checkpoint directory
     checkpoint_dir = Path(config.paths.checkpoint_dir)
@@ -675,10 +736,22 @@ def main():
     # Build models (no FACodec encoder needed - we use preprocessed tensors)
     text_processor, text_encoder, dur_predictor, smsd, style_pipe, decoder = build_models(config, device)
 
+    # ============================================================================
+    # WRAP MODELS IN DDP
+    # ============================================================================
+    if use_ddp:
+        print_rank0("\nWrapping models in DistributedDataParallel...")
+        text_encoder = DDP(text_encoder, device_ids=[local_rank], output_device=local_rank)
+        dur_predictor = DDP(dur_predictor, device_ids=[local_rank], output_device=local_rank)
+        smsd = DDP(smsd, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+        style_pipe = DDP(style_pipe, device_ids=[local_rank], output_device=local_rank)
+        decoder = DDP(decoder, device_ids=[local_rank], output_device=local_rank)
+        print_rank0("✓ All models wrapped in DDP")
+
     # Setup dataset using preprocessed tensors
-    print("\n" + "=" * 60)
-    print("Loading dataset...")
-    print("=" * 60)
+    print_rank0("\n" + "=" * 60)
+    print_rank0("Loading dataset...")
+    print_rank0("=" * 60)
     full_dataset = PreprocessedTTSDataset(
         processed_dir=config.data.processed_dir,
         mfa_root=config.data.mfa_root,
@@ -687,48 +760,72 @@ def main():
         cache_in_ram=getattr(config.data, 'cache_in_ram', False),
     )
     
-    # Split into train and validation
-    print("\nSplitting dataset...", end=" ", flush=True)
-    if config.data.validation_split > 0:
-        val_size = int(len(full_dataset) * config.data.validation_split)
-        train_size = len(full_dataset) - val_size
-        train_dataset, val_dataset = random_split(
+    # Split into train, validation, and test
+    print_rank0("\nSplitting dataset...", end=" ", flush=True)
+    val_split = getattr(config.data, 'validation_split', 0)
+    test_split = getattr(config.data, 'test_split', 0)
+    
+    if val_split > 0 or test_split > 0:
+        val_size = int(len(full_dataset) * val_split)
+        test_size = int(len(full_dataset) * test_split)
+        train_size = len(full_dataset) - val_size - test_size
+        
+        train_dataset, val_dataset, test_dataset = random_split(
             full_dataset, 
-            [train_size, val_size],
+            [train_size, val_size, test_size],
             generator=torch.Generator().manual_seed(config.training.seed)
         )
-        print(f"✓ ({train_size:,} train, {val_size:,} validation)")
+        print_rank0(f"✓ ({train_size:,} train, {val_size:,} val, {test_size:,} test)")
     else:
         train_dataset = full_dataset
         val_dataset = None
-        print(f"✓ (all {len(full_dataset):,} samples for training, no validation)")
+        test_dataset = None
+        print_rank0(f"✓ (all {len(full_dataset):,} samples for training, no validation/test)")
     
-    print("Creating data loaders...", end=" ", flush=True)
+    print_rank0("Creating data loaders...", end=" ", flush=True)
+    
+    # Use DistributedSampler for DDP
+    train_sampler = None
+    val_sampler = None
+    shuffle = config.data.shuffle
+    
+    if use_ddp:
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=config.data.shuffle)
+        shuffle = False  # Sampler handles shuffling
+    
     loader = DataLoader(
         train_dataset,
         batch_size=config.training.batch_size,
-        shuffle=config.data.shuffle,
+        shuffle=shuffle,
+        sampler=train_sampler,
         num_workers=config.data.num_workers,
         pin_memory=config.data.pin_memory,
         collate_fn=full_dataset.collate_fn,
         prefetch_factor=getattr(config.data, 'prefetch_factor', 2) if config.data.num_workers > 0 else None,
         persistent_workers=config.data.num_workers > 0,
+        drop_last=use_ddp,
     )
     
     val_loader = None
     if val_dataset is not None:
+        if use_ddp:
+            val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
         val_loader = DataLoader(
             val_dataset,
             batch_size=config.training.batch_size,
             shuffle=False,
+            sampler=val_sampler,
             num_workers=config.data.num_workers,
             pin_memory=config.data.pin_memory,
             collate_fn=full_dataset.collate_fn,
             prefetch_factor=getattr(config.data, 'prefetch_factor', 2) if config.data.num_workers > 0 else None,
             persistent_workers=config.data.num_workers > 0,
+            drop_last=use_ddp,
         )
-    print(f"✓ (batch_size={config.training.batch_size}, num_workers={config.data.num_workers})")
-    print("=" * 60)
+    
+    effective_batch = config.training.batch_size * world_size
+    print_rank0(f"✓ (batch={config.training.batch_size}×{world_size}={effective_batch}, workers={config.data.num_workers})")
+    print_rank0("=" * 60)
 
     # Setup optimizer with proper hyperparameters
     optim = torch.optim.Adam(
@@ -810,9 +907,18 @@ def main():
     epoch = 0
     first_batch = True
     
+    # Initialize gradients for accumulation
+    optim.zero_grad()
+    
     while step < config.training.max_steps and not early_stop:
         epoch += 1
-        tqdm.write(f"\n--- Epoch {epoch} starting (step {step}) ---")
+        
+        # Set epoch for DistributedSampler
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        
+        if is_main_process():
+            tqdm.write(f"\n--- Epoch {epoch} starting (step {step}) ---")
         
         for batch in loader:
             if step >= config.training.max_steps or early_stop:
@@ -929,7 +1035,7 @@ def main():
                 assert durations_target.shape == (B, ph_len), \
                     f"Duration shape mismatch after adjustment: {durations_target.shape} vs expected ({B}, {ph_len})"
                 
-                loss_dur = dur_predictor.compute_loss(log_dur_pred, durations_target, mask=phoneme_mask)
+                loss_dur = get_module(dur_predictor).compute_loss(log_dur_pred, durations_target, mask=phoneme_mask)
                 assert not torch.isnan(loss_dur), "Duration loss is NaN"
                 assert not torch.isinf(loss_dur), "Duration loss is inf"
                 
@@ -997,31 +1103,36 @@ def main():
                 f"Total loss is inf (codec={loss_codec.item():.4f}, dur={loss_dur.item():.4f}, smsd={loss_smsd.item():.4f})"
             assert loss_total.item() >= 0, f"Total loss is negative: {loss_total.item()}"
 
-            # Optimization step
-            optim.zero_grad()
-            loss_total.backward()
+            # Gradient accumulation
+            accum_steps = getattr(config.training, 'gradient_accumulation_steps', 1)
+            loss_scaled = loss_total / accum_steps  # Scale loss for accumulation
+            loss_scaled.backward()
             
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(
-                list(text_encoder.parameters()) +
-                list(dur_predictor.parameters()) +
-                list(smsd.parameters()) +
-                list(style_pipe.parameters()) +
-                list(decoder.parameters()),
-                config.training.clip_grad_norm
-            )
-            
-            optim.step()
-            
-            # Learning rate schedule: warmup then exponential decay
-            if step < config.training.warmup_steps:
-                # Linear warmup
-                lr_scale = (step + 1) / config.training.warmup_steps
-                for param_group in optim.param_groups:
-                    param_group['lr'] = config.training.lr * lr_scale
-            else:
-                # Exponential decay after warmup
-                scheduler.step()
+            # Only update weights every accum_steps
+            if (step + 1) % accum_steps == 0:
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(
+                    list(text_encoder.parameters()) +
+                    list(dur_predictor.parameters()) +
+                    list(smsd.parameters()) +
+                    list(style_pipe.parameters()) +
+                    list(decoder.parameters()),
+                    config.training.clip_grad_norm
+                )
+                
+                optim.step()
+                optim.zero_grad()
+                
+                # Learning rate schedule: warmup then exponential decay
+                actual_step = (step + 1) // accum_steps
+                if actual_step < config.training.warmup_steps:
+                    # Linear warmup
+                    lr_scale = actual_step / config.training.warmup_steps
+                    for param_group in optim.param_groups:
+                        param_group['lr'] = config.training.lr * lr_scale
+                else:
+                    # Exponential decay after warmup
+                    scheduler.step()
             
             # Track losses for smoothed progress bar display
             recent_losses['codec'].append(loss_codec.item())
@@ -1159,11 +1270,15 @@ def main():
     print(f"For inference, use: {checkpoint_dir / 'best_model.pt'}")
     print(f"{'='*60}")
     
-    print(f"\n{'='*60}")
-    print(f"Training finished!")
-    print(f"Final checkpoint saved to: {checkpoint_dir / 'final_model.pt'}")
-    print(f"To resume training, use: --resume {checkpoint_dir / f'checkpoint_step_{step:07d}.pt'}")
-    print(f"{'='*60}")
+    print_rank0(f"\n{'='*60}")
+    print_rank0(f"Training finished!")
+    print_rank0(f"Final checkpoint saved to: {checkpoint_dir / 'final_model.pt'}")
+    print_rank0(f"To resume training, use: --resume {checkpoint_dir / f'checkpoint_step_{step:07d}.pt'}")
+    print_rank0(f"{'='*60}")
+    
+    # Cleanup DDP
+    if use_ddp:
+        cleanup_ddp()
 
 
 if __name__ == "__main__":

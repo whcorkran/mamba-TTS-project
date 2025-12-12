@@ -47,10 +47,23 @@ python -m data_utils.preprocess \
     --phoneme_vocab_path .
 
 # 6. Train
+
+# Single GPU:
 python train.py --config config.yaml
 
+# Multi-GPU (DDP) - e.g., 4 GPUs:
+torchrun --nproc_per_node=4 train.py --config config.yaml
+
+# Multi-GPU with memory optimization (recommended for large batches):
+PYTORCH_ALLOC_CONF=expandable_segments:True torchrun --nproc_per_node=4 train.py --config config.yaml
+
 # 7. Resume training (if interrupted)
+
+# Single GPU:
 python train.py --config config.yaml --resume checkpoints/last_checkpoint.pt
+
+# Multi-GPU:
+torchrun --nproc_per_node=4 train.py --config config.yaml --resume checkpoints/last_checkpoint.pt
 
 ================================================================================
 Dataset Summary (after preprocessing completes):
