@@ -11,6 +11,7 @@ Implements:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from flash_attention import FlashMultiheadAttention
 
 
 class StyleProjection(nn.Module):
@@ -87,8 +88,8 @@ class StyleTextCrossAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         
-        # Multi-head cross-attention
-        self.cross_attn = nn.MultiheadAttention(
+        # Multi-head cross-attention (Flash Attention for memory efficiency)
+        self.cross_attn = FlashMultiheadAttention(
             embed_dim=d_model,
             num_heads=num_heads,
             dropout=dropout,
@@ -97,7 +98,7 @@ class StyleTextCrossAttention(nn.Module):
         
         # Post-attention layers
         self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout_layer = nn.Dropout(dropout)
         
         # Feed-forward network
         self.ffn = nn.Sequential(
@@ -130,7 +131,7 @@ class StyleTextCrossAttention(nn.Module):
         )
         
         # Residual + norm
-        text_hidden = text_hidden + self.dropout(attn_out)
+        text_hidden = text_hidden + self.dropout_layer(attn_out)
         text_hidden = self.norm(text_hidden)
         
         # Feed-forward
@@ -233,8 +234,8 @@ class StyleDecoderCrossAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         
-        # Multi-head cross-attention
-        self.cross_attn = nn.MultiheadAttention(
+        # Multi-head cross-attention (Flash Attention for memory efficiency)
+        self.cross_attn = FlashMultiheadAttention(
             embed_dim=d_model,
             num_heads=num_heads,
             dropout=dropout,
@@ -243,7 +244,7 @@ class StyleDecoderCrossAttention(nn.Module):
         
         # Post-attention layers
         self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout_layer = nn.Dropout(dropout)
         
         # Feed-forward network
         self.ffn = nn.Sequential(
@@ -275,7 +276,7 @@ class StyleDecoderCrossAttention(nn.Module):
         )
         
         # Residual + norm
-        upsampled_hidden = upsampled_hidden + self.dropout(attn_out)
+        upsampled_hidden = upsampled_hidden + self.dropout_layer(attn_out)
         upsampled_hidden = self.norm(upsampled_hidden)
         
         # Feed-forward

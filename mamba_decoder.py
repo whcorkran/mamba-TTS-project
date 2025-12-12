@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from mamba_ssm import Mamba
 from mamba_ssm.utils.generation import InferenceParams
+from flash_attention import FlashMultiheadAttention
 
 
 """Mamba-based TTS decoder module.
@@ -41,7 +42,8 @@ class MambaTTSDecoderLayer(nn.Module):
         self.mamba = Mamba(d_model, layer_idx=layer_idx)
 
         self.norm_cross = nn.LayerNorm(d_model)
-        self.cross_attn = nn.MultiheadAttention(
+        # Use Flash Attention for memory-efficient cross-attention
+        self.cross_attn = FlashMultiheadAttention(
             embed_dim=d_model,
             num_heads=n_heads,
             batch_first=True,

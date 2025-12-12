@@ -3,7 +3,7 @@
 
 # Training hyperparameters
 training:
-  batch_size: 4  # Reduced from 32 due to OOM (long sequences: 6144 tokens)
+  batch_size: 16  # Larger batches OOM on long sequences
   max_steps: 400000  # Full training (use 10 for sanity check)
   
   # Optimizer settings (from baseline configs)
@@ -81,11 +81,14 @@ data:
   # Whether to require MFA alignments (skip samples without them)
   require_mfa: true
   
+  # RAM caching: load ALL tensors into RAM at startup (uses ~16GB, eliminates disk I/O)
+  cache_in_ram: true
+  
   # Validation split (for best model selection and early stopping)
   validation_split: 0.01  # Use 1% of data for validation (~2,890 samples)
   
   # DataLoader settings
-  num_workers: 4  # Number of data loading workers
+  num_workers: 4  # Balance between prefetching and overhead
   shuffle: true
   pin_memory: true
 

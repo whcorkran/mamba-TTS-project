@@ -228,6 +228,18 @@ def build_models(config: Config, device: torch.device):
     ).to(device)
     print(f"✓ ({config.model.mamba_decoder.n_layers} layers)")
     
+    # Apply torch.compile for faster training (PyTorch 2.0+)
+    # NOTE: Disabled due to Inductor/Dynamo issues with symbolic shape tracing
+    # causing AssertionError with negative values in shape calculations.
+    # Uncomment below if you want to try torch.compile with fixed shapes:
+    # print("\nApplying torch.compile() for optimized execution...")
+    # text_encoder = torch.compile(text_encoder, dynamic=False)
+    # dur_predictor = torch.compile(dur_predictor, dynamic=False)
+    # style_pipe = torch.compile(style_pipe, dynamic=False)
+    # decoder = torch.compile(decoder, dynamic=False)
+    # print("✓ Models compiled (first batch will be slow due to compilation)")
+    print("\nSkipping torch.compile() (dynamic shapes not supported)")
+    
     # Count parameters
     total_params = sum(
         sum(p.numel() for p in model.parameters())
@@ -644,6 +656,8 @@ def main():
     torch.manual_seed(config.training.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.training.seed)
+        # Enable cuDNN benchmark for faster convolutions
+        torch.backends.cudnn.benchmark = True
 
     # Setup device
     if config.training.device == "cuda" and not torch.cuda.is_available():
@@ -670,6 +684,7 @@ def main():
         mfa_root=config.data.mfa_root,
         require_mfa=config.data.require_mfa,
         sample_rate=SAMPLE_RATE,
+        cache_in_ram=getattr(config.data, 'cache_in_ram', False),
     )
     
     # Split into train and validation
@@ -696,6 +711,8 @@ def main():
         num_workers=config.data.num_workers,
         pin_memory=config.data.pin_memory,
         collate_fn=full_dataset.collate_fn,
+        prefetch_factor=getattr(config.data, 'prefetch_factor', 2) if config.data.num_workers > 0 else None,
+        persistent_workers=config.data.num_workers > 0,
     )
     
     val_loader = None
@@ -707,6 +724,8 @@ def main():
             num_workers=config.data.num_workers,
             pin_memory=config.data.pin_memory,
             collate_fn=full_dataset.collate_fn,
+            prefetch_factor=getattr(config.data, 'prefetch_factor', 2) if config.data.num_workers > 0 else None,
+            persistent_workers=config.data.num_workers > 0,
         )
     print(f"✓ (batch_size={config.training.batch_size}, num_workers={config.data.num_workers})")
     print("=" * 60)
@@ -806,265 +825,301 @@ def main():
 
             # ============================================================================
             # Batch format from PreprocessedTTSDataset:
-        #   inputs: dict with phoneme_ids, phoneme_mask, text_prompt, style_prompt,
-        #           style_emb (precomputed), durations, voice_codec
-        #   target_codec: (B, T_target, 6) preprocessed FACodec tokens
-        # ============================================================================
-        inputs, target_codec = batch
-        
-        # Validate batch structure
-        assert isinstance(inputs, dict), f"inputs must be dict, got {type(inputs)}"
-        required_keys = ['phoneme_ids', 'phoneme_mask', 'style_emb', 'voice_codec', 
-                        'text_prompt', 'style_prompt', 'durations']
-        for key in required_keys:
-            assert key in inputs, f"Missing required key '{key}' in batch inputs"
-        
-        # Move tensors to device
-        phoneme_ids = inputs['phoneme_ids'].to(device)           # (B, T_phonemes)
-        phoneme_mask = inputs['phoneme_mask'].to(device)         # (B, T_phonemes) True=pad
-        style_embs_gt = inputs['style_emb'].to(device)           # (B, 512) precomputed
-        voice_codec = inputs['voice_codec'].to(device)           # (B, T_ref, 6)
-        target_codec = target_codec.to(device)                   # (B, T_target, 6)
-        
-        text_prompts = inputs['text_prompt']                     # List[str]
-        style_prompts = inputs['style_prompt']                   # List[str]
-        
-        B = phoneme_ids.shape[0]
-        assert B > 0, "Batch size is 0"
-        
-        # Validate tensor shapes
-        assert phoneme_ids.dim() == 2, f"phoneme_ids should be (B, T), got {phoneme_ids.shape}"
-        assert phoneme_mask.shape == phoneme_ids.shape, \
-            f"phoneme_mask shape {phoneme_mask.shape} != phoneme_ids shape {phoneme_ids.shape}"
-        assert style_embs_gt.shape == (B, 512), f"style_embs_gt should be (B, 512), got {style_embs_gt.shape}"
-        assert voice_codec.dim() == 3 and voice_codec.shape[2] == 6, \
-            f"voice_codec should be (B, T_ref, 6), got {voice_codec.shape}"
-        assert target_codec.dim() == 3 and target_codec.shape[2] == 6, \
-            f"target_codec should be (B, T_target, 6), got {target_codec.shape}"
-        assert len(text_prompts) == B, f"text_prompts length {len(text_prompts)} != batch size {B}"
-        assert len(style_prompts) == B, f"style_prompts length {len(style_prompts)} != batch size {B}"
-        
-        # Convert target codec to audio tokens for decoder
-        # target_codec: (B, T, 6) -> audio_tokens: (B, 6*T)
-        audio_tokens_3d = target_codec.permute(0, 2, 1).long()   # (B, 6, T)
-        audio_tokens = audio_tokens_3d.reshape(B, -1)            # (B, 6*T)
-        pad_id = 0
-
-        # Text encoding using preprocessed phoneme IDs
-        text_hidden = text_encoder(phoneme_ids, mask=phoneme_mask)  # (B, T_text, d_model)
-
-        # Style Processing (SMSD module)
-        # ============================================================================
-        # The preprocessed style_emb is the ground truth from FACodec.
-        # SMSD learns to predict this from style text descriptions.
-        # ============================================================================
-        
-        # Training mode: compute SMSD loss (text description → ground truth style)
-        loss_smsd = smsd(style_prompts, y_true=style_embs_gt)
-        assert not torch.isnan(loss_smsd), "SMSD loss is NaN"
-        assert not torch.isinf(loss_smsd), "SMSD loss is inf"
-        
-        # Inference mode: sample style embedding from SMSD's learned distribution
-        # NOTE: We use SMSD's sampled output (not ground truth) to match inference behavior
-        with torch.no_grad():
-            style_emb = smsd(style_prompts)
-        style_emb = style_emb.to(device)
-
-        # Duration Prediction (REQUIRES MFA ALIGNMENTS)
-        # ============================================================================
-        # Durations come from MFA TextGrid files, loaded by PreprocessedTTSDataset.
-        # Dataset is configured with require_mfa=True, so all samples have durations.
-        # ============================================================================
-        log_dur_pred = dur_predictor(text_hidden, mask=phoneme_mask)  # (B, T_text)
-        
-        # MFA durations are REQUIRED - dataset filters samples without them
-        durations_target = inputs['durations']
-        if durations_target is None:
-            raise RuntimeError(
-                "MFA durations are None! This should not happen with require_mfa=True. "
-                "Check your MFA TextGrid files in VccmDataset/mfa_outputs/"
-            )
-        durations_target = durations_target.to(device)
-        
-        # Handle potential length mismatch between durations and phoneme_ids
-        # (MFA may have different phoneme count than our tokenizer)
-        dur_len = durations_target.shape[1]
-        ph_len = phoneme_ids.shape[1]
-        if dur_len != ph_len:
-            # Log warning for significant mismatches (> 20% difference)
-            mismatch_ratio = abs(dur_len - ph_len) / max(dur_len, ph_len)
-            if mismatch_ratio > 0.2:
-                print(f"WARNING: Large duration/phoneme length mismatch: "
-                      f"dur={dur_len}, ph={ph_len} ({mismatch_ratio:.1%} diff). "
-                      f"This may indicate tokenizer/MFA alignment issues.")
+            #   inputs: dict with phoneme_ids, phoneme_mask, text_prompt, style_prompt,
+            #           style_emb (precomputed), durations, voice_codec
+            #   target_codec: (B, T_target, 6) preprocessed FACodec tokens
+            # ============================================================================
+            inputs, target_codec = batch
             
-            # Pad or truncate durations to match phoneme length
-            if dur_len < ph_len:
-                durations_target = F.pad(durations_target, (0, ph_len - dur_len), value=0)
-            else:
-                durations_target = durations_target[:, :ph_len]
-        
-        assert durations_target.shape == (B, ph_len), \
-            f"Duration shape mismatch after adjustment: {durations_target.shape} vs expected ({B}, {ph_len})"
-        
-        loss_dur = dur_predictor.compute_loss(log_dur_pred, durations_target, mask=phoneme_mask)
-        assert not torch.isnan(loss_dur), "Duration loss is NaN"
-        assert not torch.isinf(loss_dur), "Duration loss is inf"
-        
-        durations_for_lr = torch.exp(log_dur_pred).detach()
+            # Validate batch structure
+            assert isinstance(inputs, dict), f"inputs must be dict, got {type(inputs)}"
+            required_keys = ['phoneme_ids', 'phoneme_mask', 'style_emb', 'voice_codec', 
+                            'text_prompt', 'style_prompt', 'durations']
+            for key in required_keys:
+                assert key in inputs, f"Missing required key '{key}' in batch inputs"
+            
+            # Move tensors to device
+            phoneme_ids = inputs['phoneme_ids'].to(device)           # (B, T_phonemes)
+            phoneme_mask = inputs['phoneme_mask'].to(device)         # (B, T_phonemes) True=pad
+            style_embs_gt = inputs['style_emb'].to(device)           # (B, 512) precomputed
+            voice_codec = inputs['voice_codec'].to(device)           # (B, T_ref, 6)
+            target_codec = target_codec.to(device)                   # (B, T_target, 6)
+            
+            text_prompts = inputs['text_prompt']                     # List[str]
+            style_prompts = inputs['style_prompt']                   # List[str]
+            
+            B = phoneme_ids.shape[0]
+            assert B > 0, "Batch size is 0"
+            
+            # Validate tensor shapes
+            assert phoneme_ids.dim() == 2, f"phoneme_ids should be (B, T), got {phoneme_ids.shape}"
+            assert phoneme_mask.shape == phoneme_ids.shape, \
+                f"phoneme_mask shape {phoneme_mask.shape} != phoneme_ids shape {phoneme_ids.shape}"
+            assert style_embs_gt.shape == (B, 512), f"style_embs_gt should be (B, 512), got {style_embs_gt.shape}"
+            assert voice_codec.dim() == 3 and voice_codec.shape[2] == 6, \
+                f"voice_codec should be (B, T_ref, 6), got {voice_codec.shape}"
+            assert target_codec.dim() == 3 and target_codec.shape[2] == 6, \
+                f"target_codec should be (B, T_target, 6), got {target_codec.shape}"
+            assert len(text_prompts) == B, f"text_prompts length {len(text_prompts)} != batch size {B}"
+            assert len(style_prompts) == B, f"style_prompts length {len(style_prompts)} != batch size {B}"
+            
+            # Convert target codec to audio tokens for decoder
+            # target_codec: (B, T, 6) -> audio_tokens: (B, 6*T)
+            audio_tokens_3d = target_codec.permute(0, 2, 1).long()   # (B, 6, T)
+            audio_tokens = audio_tokens_3d.reshape(B, -1)            # (B, 6*T)
+            pad_id = 0
 
-        # Style conditioning + length regulation 
-        styled_frames, frame_lengths, style_K, style_V = style_pipe(
-            text_hidden, style_emb, durations_for_lr, text_mask=phoneme_mask
-        )
-        # styled_frames: (B, T_frame, d_model) - frame-level, style-conditioned features
-        
-        # Validate style pipeline outputs
-        assert styled_frames.dim() == 3 and styled_frames.shape[0] == B, \
-            f"styled_frames should be (B, T_frame, d_model), got {styled_frames.shape}"
-        assert styled_frames.shape[2] == D_MODEL, \
-            f"styled_frames d_model mismatch: {styled_frames.shape[2]} != {D_MODEL}"
-        assert frame_lengths.shape == (B,), f"frame_lengths should be (B,), got {frame_lengths.shape}"
-        assert (frame_lengths > 0).all(), "All frame_lengths must be positive"
-        
-        # Create frame-level mask based on actual lengths
-        max_frame = styled_frames.shape[1]
-        frame_mask = torch.arange(max_frame, device=device)[None, :].expand(B, -1) < frame_lengths[:, None]
+            # Use BF16 mixed precision for faster training on A100
+            # BF16 has same exponent range as FP32, so no GradScaler needed
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                # Text encoding using preprocessed phoneme IDs
+                text_hidden = text_encoder(phoneme_ids, mask=phoneme_mask)  # (B, T_text, d_model)
 
-        # Voice prompt as reference for timbre cloning
-        # voice_codec is already preprocessed: (B, T_ref, 6)
-        assert voice_codec.shape[0] == B, f"voice_codec batch size mismatch: {voice_codec.shape[0]} != {B}"
-        voice_tokens_3d = voice_codec.permute(0, 2, 1).long()  # (B, 6, T_ref)
-        assert voice_tokens_3d.shape[1] == NUM_QUANTIZERS, \
-            f"voice_codec should have {NUM_QUANTIZERS} quantizers, got {voice_tokens_3d.shape[1]}"
-        ref_hidden, voice_mask = embed_codec_tokens(voice_tokens_3d, decoder)
+                # Style Processing (SMSD module)
+                # ============================================================================
+                # The preprocessed style_emb is the ground truth from FACodec.
+                # SMSD learns to predict this from style text descriptions.
+                # ============================================================================
+                
+                # Training mode: compute SMSD loss (text description → ground truth style)
+                loss_smsd = smsd(style_prompts, y_true=style_embs_gt)
+                assert not torch.isnan(loss_smsd), "SMSD loss is NaN"
+                assert not torch.isinf(loss_smsd), "SMSD loss is inf"
+                
+                # Inference mode: sample style embedding from SMSD's learned distribution
+                # NOTE: We use SMSD's sampled output (not ground truth) to match inference behavior
+                with torch.no_grad():
+                    style_emb = smsd(style_prompts)
+                style_emb = style_emb.to(device)
 
-        # Decoder forward pass
-        logits = decoder(
-            audio_tokens=audio_tokens,
-            styled_frames=styled_frames,
-            styled_mask=frame_mask,
-            ref_hidden=ref_hidden,
-            ref_mask=voice_mask,
-        )
-        
-        # Validate decoder output
-        expected_logits_shape = (B, audio_tokens.shape[1], VOCAB_SIZE_AUDIO)
-        assert logits.shape == expected_logits_shape, \
-            f"Decoder logits shape mismatch: {logits.shape} != expected {expected_logits_shape}"
-        assert not torch.isnan(logits).any(), "Decoder produced NaN logits"
-        assert not torch.isinf(logits).any(), "Decoder produced Inf logits"
-        
-        loss_codec = codec_ce_loss(logits, audio_tokens, pad_id=pad_id)
-        assert not torch.isnan(loss_codec), "Codec loss is NaN"
-        assert not torch.isinf(loss_codec), "Codec loss is inf"
+                # Duration Prediction (REQUIRES MFA ALIGNMENTS)
+                # ============================================================================
+                # Durations come from MFA TextGrid files, loaded by PreprocessedTTSDataset.
+                # Dataset is configured with require_mfa=True, so all samples have durations.
+                # ============================================================================
+                log_dur_pred = dur_predictor(text_hidden, mask=phoneme_mask)  # (B, T_text)
+                
+                # MFA durations are REQUIRED - dataset filters samples without them
+                durations_target = inputs['durations']
+                if durations_target is None:
+                    raise RuntimeError(
+                        "MFA durations are None! This should not happen with require_mfa=True. "
+                        "Check your MFA TextGrid files in VccmDataset/mfa_outputs/"
+                    )
+                durations_target = durations_target.to(device)
+                
+                # Handle potential length mismatch between durations and phoneme_ids
+                # (MFA may have different phoneme count than our tokenizer)
+                dur_len = durations_target.shape[1]
+                ph_len = phoneme_ids.shape[1]
+                if dur_len != ph_len:
+                    # Log warning for significant mismatches (> 20% difference)
+                    mismatch_ratio = abs(dur_len - ph_len) / max(dur_len, ph_len)
+                    if mismatch_ratio > 0.2:
+                        print(f"WARNING: Large duration/phoneme length mismatch: "
+                              f"dur={dur_len}, ph={ph_len} ({mismatch_ratio:.1%} diff). "
+                              f"This may indicate tokenizer/MFA alignment issues.")
+                    
+                    # Pad or truncate durations to match phoneme length
+                    if dur_len < ph_len:
+                        durations_target = F.pad(durations_target, (0, ph_len - dur_len), value=0)
+                    else:
+                        durations_target = durations_target[:, :ph_len]
+                
+                assert durations_target.shape == (B, ph_len), \
+                    f"Duration shape mismatch after adjustment: {durations_target.shape} vs expected ({B}, {ph_len})"
+                
+                loss_dur = dur_predictor.compute_loss(log_dur_pred, durations_target, mask=phoneme_mask)
+                assert not torch.isnan(loss_dur), "Duration loss is NaN"
+                assert not torch.isinf(loss_dur), "Duration loss is inf"
+                
+                durations_for_lr = torch.exp(log_dur_pred).detach()
+                # Ensure minimum duration of 1 frame per phoneme to avoid zero-length outputs
+                durations_for_lr = durations_for_lr.clamp(min=1.0)
 
-        # Compute total loss with configured weights
-        loss_total = (
-            config.training.w_codec * loss_codec +
-            config.training.w_dur * loss_dur +
-            config.training.w_smsd * loss_smsd
-        )
-        
-        # Validate total loss before backward
-        assert not torch.isnan(loss_total), \
-            f"Total loss is NaN (codec={loss_codec.item():.4f}, dur={loss_dur.item():.4f}, smsd={loss_smsd.item():.4f})"
-        assert not torch.isinf(loss_total), \
-            f"Total loss is inf (codec={loss_codec.item():.4f}, dur={loss_dur.item():.4f}, smsd={loss_smsd.item():.4f})"
-        assert loss_total.item() >= 0, f"Total loss is negative: {loss_total.item()}"
+                # Style conditioning + length regulation 
+                styled_frames, frame_lengths, style_K, style_V = style_pipe(
+                    text_hidden, style_emb, durations_for_lr, text_mask=phoneme_mask
+                )
+                # styled_frames: (B, T_frame, d_model) - frame-level, style-conditioned features
+                
+                # Validate style pipeline outputs
+                assert styled_frames.dim() == 3 and styled_frames.shape[0] == B, \
+                    f"styled_frames should be (B, T_frame, d_model), got {styled_frames.shape}"
+                assert styled_frames.shape[2] == D_MODEL, \
+                    f"styled_frames d_model mismatch: {styled_frames.shape[2]} != {D_MODEL}"
+                assert frame_lengths.shape == (B,), f"frame_lengths should be (B,), got {frame_lengths.shape}"
+                assert (frame_lengths > 0).all(), "All frame_lengths must be positive"
+                
+                # Create frame-level mask based on actual lengths
+                max_frame = styled_frames.shape[1]
+                frame_mask = torch.arange(max_frame, device=device)[None, :].expand(B, -1) < frame_lengths[:, None]
 
-        # Optimization step
-        optim.zero_grad()
-        loss_total.backward()
-        
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(
-            list(text_encoder.parameters()) +
-            list(dur_predictor.parameters()) +
-            list(smsd.parameters()) +
-            list(style_pipe.parameters()) +
-            list(decoder.parameters()),
-            config.training.clip_grad_norm
-        )
-        
-        optim.step()
-        
-        # Learning rate schedule: warmup then exponential decay
-        if step < config.training.warmup_steps:
-            # Linear warmup
-            lr_scale = (step + 1) / config.training.warmup_steps
-            for param_group in optim.param_groups:
-                param_group['lr'] = config.training.lr * lr_scale
-        else:
-            # Exponential decay after warmup
-            scheduler.step()
-        
-        # Track losses for smoothed progress bar display
-        recent_losses['codec'].append(loss_codec.item())
-        recent_losses['dur'].append(loss_dur.item())
-        recent_losses['smsd'].append(loss_smsd.item())
-        recent_losses['total'].append(loss_total.item())
-        
-        # Keep only recent losses for smoothing
-        for key in recent_losses:
-            if len(recent_losses[key]) > smoothing_window:
-                recent_losses[key] = recent_losses[key][-smoothing_window:]
-        
-        # Update progress bar
-        current_lr = optim.param_groups[0]['lr']
-        avg_loss = sum(recent_losses['total']) / len(recent_losses['total'])
-        pbar.set_postfix({
-            'loss': f'{avg_loss:.3f}',
-            'lr': f'{current_lr:.1e}',
-            'epoch': epoch,
-        })
-        pbar.update(1)
-        
-        # Detailed logging at intervals
-        if step % config.training.log_interval == 0:
-            tqdm.write(
-                f"[Step {step:6d}] lr={current_lr:.2e} | "
-                f"loss={loss_total.item():.4f} "
-                f"(codec={loss_codec.item():.4f}, "
-                f"dur={loss_dur.item():.4f}, "
-                f"smsd={loss_smsd.item():.4f})"
-            )
-        
-        # Validation and checkpointing
-        if step % config.training.save_interval == 0 and step > 0:
-            # Run validation if available
-            if val_loader is not None:
-                tqdm.write(f"\n{'=' * 40}")
-                tqdm.write(f"Running validation at step {step}...")
-                val_metrics = validate(
-                    val_loader,
-                    text_encoder,
-                    dur_predictor,
-                    smsd,
-                    style_pipe,
-                    decoder,
-                    config,
-                    device,
-                    max_batches=50,  # Limit validation time
+                # Voice prompt as reference for timbre cloning
+                # voice_codec is already preprocessed: (B, T_ref, 6)
+                assert voice_codec.shape[0] == B, f"voice_codec batch size mismatch: {voice_codec.shape[0]} != {B}"
+                voice_tokens_3d = voice_codec.permute(0, 2, 1).long()  # (B, 6, T_ref)
+                assert voice_tokens_3d.shape[1] == NUM_QUANTIZERS, \
+                    f"voice_codec should have {NUM_QUANTIZERS} quantizers, got {voice_tokens_3d.shape[1]}"
+                ref_hidden, voice_mask = embed_codec_tokens(voice_tokens_3d, decoder)
+
+                # Decoder forward pass
+                logits = decoder(
+                    audio_tokens=audio_tokens,
+                    styled_frames=styled_frames,
+                    styled_mask=frame_mask,
+                    ref_hidden=ref_hidden,
+                    ref_mask=voice_mask,
                 )
                 
-                val_loss = val_metrics['val_loss_total']
-                tqdm.write(f"Validation: loss={val_loss:.4f} "
-                           f"(codec={val_metrics['val_loss_codec']:.4f}, "
-                           f"dur={val_metrics['val_loss_dur']:.4f}, "
-                           f"smsd={val_metrics['val_loss_smsd']:.4f})")
+                # Validate decoder output
+                expected_logits_shape = (B, audio_tokens.shape[1], VOCAB_SIZE_AUDIO)
+                assert logits.shape == expected_logits_shape, \
+                    f"Decoder logits shape mismatch: {logits.shape} != expected {expected_logits_shape}"
+                assert not torch.isnan(logits).any(), "Decoder produced NaN logits"
+                assert not torch.isinf(logits).any(), "Decoder produced Inf logits"
                 
-                # Check if this is the best model
-                improvement = best_val_loss - val_loss
-                if improvement > config.training.early_stopping_min_delta:
-                    tqdm.write(f"✓ New best model! (previous: {best_val_loss:.4f}, improvement: {improvement:.4f})")
-                    best_val_loss = val_loss
-                    steps_without_improvement = 0
+                loss_codec = codec_ce_loss(logits, audio_tokens, pad_id=pad_id)
+                assert not torch.isnan(loss_codec), "Codec loss is NaN"
+                assert not torch.isinf(loss_codec), "Codec loss is inf"
+
+                # Compute total loss with configured weights
+                loss_total = (
+                    config.training.w_codec * loss_codec +
+                    config.training.w_dur * loss_dur +
+                    config.training.w_smsd * loss_smsd
+                )
+            
+            # Validate total loss before backward (outside autocast)
+            assert not torch.isnan(loss_total), \
+                f"Total loss is NaN (codec={loss_codec.item():.4f}, dur={loss_dur.item():.4f}, smsd={loss_smsd.item():.4f})"
+            assert not torch.isinf(loss_total), \
+                f"Total loss is inf (codec={loss_codec.item():.4f}, dur={loss_dur.item():.4f}, smsd={loss_smsd.item():.4f})"
+            assert loss_total.item() >= 0, f"Total loss is negative: {loss_total.item()}"
+
+            # Optimization step
+            optim.zero_grad()
+            loss_total.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(
+                list(text_encoder.parameters()) +
+                list(dur_predictor.parameters()) +
+                list(smsd.parameters()) +
+                list(style_pipe.parameters()) +
+                list(decoder.parameters()),
+                config.training.clip_grad_norm
+            )
+            
+            optim.step()
+            
+            # Learning rate schedule: warmup then exponential decay
+            if step < config.training.warmup_steps:
+                # Linear warmup
+                lr_scale = (step + 1) / config.training.warmup_steps
+                for param_group in optim.param_groups:
+                    param_group['lr'] = config.training.lr * lr_scale
+            else:
+                # Exponential decay after warmup
+                scheduler.step()
+            
+            # Track losses for smoothed progress bar display
+            recent_losses['codec'].append(loss_codec.item())
+            recent_losses['dur'].append(loss_dur.item())
+            recent_losses['smsd'].append(loss_smsd.item())
+            recent_losses['total'].append(loss_total.item())
+            
+            # Keep only recent losses for smoothing
+            for key in recent_losses:
+                if len(recent_losses[key]) > smoothing_window:
+                    recent_losses[key] = recent_losses[key][-smoothing_window:]
+            
+            # Update progress bar
+            current_lr = optim.param_groups[0]['lr']
+            avg_loss = sum(recent_losses['total']) / len(recent_losses['total'])
+            pbar.set_postfix({
+                'loss': f'{avg_loss:.3f}',
+                'lr': f'{current_lr:.1e}',
+                'epoch': epoch,
+            })
+            pbar.update(1)
+            
+            # Detailed logging at intervals
+            if step % config.training.log_interval == 0:
+                tqdm.write(
+                    f"[Step {step:6d}] lr={current_lr:.2e} | "
+                    f"loss={loss_total.item():.4f} "
+                    f"(codec={loss_codec.item():.4f}, "
+                    f"dur={loss_dur.item():.4f}, "
+                    f"smsd={loss_smsd.item():.4f})"
+                )
+            
+            # Validation and checkpointing
+            if step % config.training.save_interval == 0 and step > 0:
+                # Run validation if available
+                if val_loader is not None:
+                    tqdm.write(f"\n{'=' * 40}")
+                    tqdm.write(f"Running validation at step {step}...")
+                    val_metrics = validate(
+                        val_loader,
+                        text_encoder,
+                        dur_predictor,
+                        smsd,
+                        style_pipe,
+                        decoder,
+                        config,
+                        device,
+                        max_batches=50,  # Limit validation time
+                    )
                     
-                    # Save best model
-                    tqdm.write(f"  Saving best model...")
+                    val_loss = val_metrics['val_loss_total']
+                    tqdm.write(f"Validation: loss={val_loss:.4f} "
+                               f"(codec={val_metrics['val_loss_codec']:.4f}, "
+                               f"dur={val_metrics['val_loss_dur']:.4f}, "
+                               f"smsd={val_metrics['val_loss_smsd']:.4f})")
+                    
+                    # Check if this is the best model
+                    improvement = best_val_loss - val_loss
+                    if improvement > config.training.early_stopping_min_delta:
+                        tqdm.write(f"✓ New best model! (previous: {best_val_loss:.4f}, improvement: {improvement:.4f})")
+                        best_val_loss = val_loss
+                        steps_without_improvement = 0
+                        
+                        # Save best model
+                        tqdm.write(f"  Saving best model...")
+                        save_checkpoint(
+                            "best_model.pt",
+                            step,
+                            text_encoder,
+                            dur_predictor,
+                            smsd,
+                            style_pipe,
+                            decoder,
+                            optim,
+                            scheduler,
+                            config,
+                            checkpoint_dir,
+                            val_loss=val_loss,
+                            extra_info={'val_metrics': val_metrics},
+                        )
+                        tqdm.write(f"  ✓ Saved to {checkpoint_dir / 'best_model.pt'}")
+                    else:
+                        steps_without_improvement += 1
+                        tqdm.write(f"  No improvement ({steps_without_improvement}/{config.training.early_stopping_patience})")
+                        
+                        # Early stopping check
+                        if config.training.early_stopping_patience > 0 and \
+                           steps_without_improvement >= config.training.early_stopping_patience:
+                            tqdm.write(f"\n⚠ Early stopping triggered! No improvement for {steps_without_improvement} validations.")
+                            early_stop = True
+                    
+                    tqdm.write(f"{'=' * 40}\n")
+                
+                # Save last checkpoint (for recovery)
+                if config.training.save_last_checkpoint:
+                    tqdm.write(f"  Saving checkpoint...")
                     save_checkpoint(
-                        "best_model.pt",
+                        "last_checkpoint.pt",
                         step,
                         text_encoder,
                         dur_predictor,
@@ -1075,42 +1130,11 @@ def main():
                         scheduler,
                         config,
                         checkpoint_dir,
-                        val_loss=val_loss,
-                        extra_info={'val_metrics': val_metrics},
+                        val_loss=val_loss if val_loader else None,
                     )
-                    tqdm.write(f"  ✓ Saved to {checkpoint_dir / 'best_model.pt'}")
-                else:
-                    steps_without_improvement += 1
-                    tqdm.write(f"  No improvement ({steps_without_improvement}/{config.training.early_stopping_patience})")
-                    
-                    # Early stopping check
-                    if config.training.early_stopping_patience > 0 and \
-                       steps_without_improvement >= config.training.early_stopping_patience:
-                        tqdm.write(f"\n⚠ Early stopping triggered! No improvement for {steps_without_improvement} validations.")
-                        early_stop = True
-                
-                tqdm.write(f"{'=' * 40}\n")
+                    tqdm.write(f"  ✓ Saved to {checkpoint_dir / 'last_checkpoint.pt'}")
             
-            # Save last checkpoint (for recovery)
-            if config.training.save_last_checkpoint:
-                tqdm.write(f"  Saving checkpoint...")
-                save_checkpoint(
-                    "last_checkpoint.pt",
-                    step,
-                    text_encoder,
-                    dur_predictor,
-                    smsd,
-                    style_pipe,
-                    decoder,
-                    optim,
-                    scheduler,
-                    config,
-                    checkpoint_dir,
-                    val_loss=val_loss if val_loader else None,
-                )
-                tqdm.write(f"  ✓ Saved to {checkpoint_dir / 'last_checkpoint.pt'}")
-        
-        step += 1
+            step += 1
     
     # Close progress bar
     pbar.close()

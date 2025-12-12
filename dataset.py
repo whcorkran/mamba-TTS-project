@@ -49,6 +49,7 @@ class PreprocessedTTSDataset(Dataset):
         require_mfa: bool = True,
         cache_mfa_index: bool = True,
         sample_rate: int = 16000,
+        cache_in_ram: bool = False,
     ):
         """
         Args:
@@ -57,12 +58,20 @@ class PreprocessedTTSDataset(Dataset):
             require_mfa: If True, skip samples without MFA alignments
             cache_mfa_index: If True, build index of all TextGrid files for fast lookup
             sample_rate: Sample rate (for duration frame calculation)
+            cache_in_ram: If True, load ALL tensors into RAM at startup (fast training, uses ~16GB RAM)
         """
         self.processed_dir = Path(processed_dir)
         self.mfa_root = Path(mfa_root)
         self.require_mfa = require_mfa
         self.sample_rate = sample_rate
         self.hop_size = 256  # FACodec hop size
+        self.cache_in_ram = cache_in_ram
+        
+        # RAM cache dictionaries (populated if cache_in_ram=True)
+        self._phoneme_cache: Dict[str, torch.Tensor] = {}
+        self._style_cache: Dict[str, torch.Tensor] = {}
+        self._codec_cache: Dict[str, torch.Tensor] = {}
+        self._duration_cache: Dict[str, torch.Tensor] = {}
         
         # Load metadata
         metadata_path = self.processed_dir / "metadata.json"
@@ -138,10 +147,69 @@ class PreprocessedTTSDataset(Dataset):
             f"Check that processed_data/tensors/ contains tensor files and "
             f"VccmDataset/mfa_outputs/ contains TextGrid files."
         )
+        
+        # Load all data into RAM if requested
+        if self.cache_in_ram:
+            self._load_all_into_ram(tensors_dir)
     
     def _safe_name(self, item_name: str) -> str:
         """Convert item_name to safe filename (matches preprocessing script)."""
         return item_name.replace('/', '_').replace(' ', '_')
+    
+    def _load_all_into_ram(self, tensors_dir: Path):
+        """Load all tensors and durations into RAM for fast access."""
+        print(f"\n{'='*60}")
+        print("Loading ALL data into RAM (this may take a minute)...")
+        print(f"{'='*60}")
+        
+        # Collect all unique safe_names we need to load
+        safe_names_to_load = set()
+        for idx in self.valid_indices:
+            meta = self.all_metadata[idx]
+            safe_names_to_load.add(self._safe_name(meta['item_name']))
+        
+        # Load all tensors with progress bar
+        for safe_name in tqdm(safe_names_to_load, desc="Loading tensors into RAM"):
+            phoneme_path = tensors_dir / f"{safe_name}_phonemes.pt"
+            style_path = tensors_dir / f"{safe_name}_style.pt"
+            codec_path = tensors_dir / f"{safe_name}_codec.pt"
+            
+            if phoneme_path.exists():
+                self._phoneme_cache[safe_name] = torch.load(phoneme_path, weights_only=True)
+            if style_path.exists():
+                self._style_cache[safe_name] = torch.load(style_path, weights_only=True)
+            if codec_path.exists():
+                self._codec_cache[safe_name] = torch.load(codec_path, weights_only=True)
+        
+        # Pre-cache all durations from TextGrids
+        if self.require_mfa:
+            print("Pre-caching MFA durations...")
+            for idx in tqdm(self.valid_indices, desc="Caching durations"):
+                meta = self.all_metadata[idx]
+                item_name = meta['item_name']
+                safe_name = self._safe_name(item_name)
+                tg_stem = self._item_name_to_textgrid_stem(item_name)
+                
+                if tg_stem in self.textgrid_index and safe_name not in self._duration_cache:
+                    phoneme_ids = self._phoneme_cache.get(safe_name)
+                    if phoneme_ids is not None:
+                        durations = self._load_durations_from_textgrid(
+                            self.textgrid_index[tg_stem],
+                            num_phonemes=len(phoneme_ids)
+                        )
+                        if durations is not None:
+                            self._duration_cache[safe_name] = durations
+        
+        # Report memory usage
+        import sys
+        total_size = 0
+        for cache in [self._phoneme_cache, self._style_cache, self._codec_cache, self._duration_cache]:
+            for tensor in cache.values():
+                total_size += tensor.element_size() * tensor.nelement()
+        
+        print(f"\n✓ Loaded {len(self._codec_cache)} samples into RAM")
+        print(f"✓ Total RAM usage: {total_size / 1e9:.2f} GB")
+        print(f"{'='*60}\n")
     
     def _item_name_to_textgrid_stem(self, item_name: str) -> str:
         """
@@ -236,20 +304,25 @@ class PreprocessedTTSDataset(Dataset):
         
         item_name = meta['item_name']
         safe_name = self._safe_name(item_name)
-        tensors_dir = self.processed_dir / "tensors"
         
-        # Load preprocessed tensors
-        phoneme_path = tensors_dir / f"{safe_name}_phonemes.pt"
-        style_path = tensors_dir / f"{safe_name}_style.pt"
-        codec_path = tensors_dir / f"{safe_name}_codec.pt"
-        
-        assert phoneme_path.exists(), f"Phoneme tensor not found: {phoneme_path}"
-        assert style_path.exists(), f"Style tensor not found: {style_path}"
-        assert codec_path.exists(), f"Codec tensor not found: {codec_path}"
-        
-        phoneme_ids = torch.load(phoneme_path, weights_only=True)
-        style_emb = torch.load(style_path, weights_only=True)
-        target_codec = torch.load(codec_path, weights_only=True)
+        # Load from RAM cache or disk
+        if self.cache_in_ram:
+            phoneme_ids = self._phoneme_cache[safe_name]
+            style_emb = self._style_cache[safe_name]
+            target_codec = self._codec_cache[safe_name]
+        else:
+            tensors_dir = self.processed_dir / "tensors"
+            phoneme_path = tensors_dir / f"{safe_name}_phonemes.pt"
+            style_path = tensors_dir / f"{safe_name}_style.pt"
+            codec_path = tensors_dir / f"{safe_name}_codec.pt"
+            
+            assert phoneme_path.exists(), f"Phoneme tensor not found: {phoneme_path}"
+            assert style_path.exists(), f"Style tensor not found: {style_path}"
+            assert codec_path.exists(), f"Codec tensor not found: {codec_path}"
+            
+            phoneme_ids = torch.load(phoneme_path, weights_only=True)
+            style_emb = torch.load(style_path, weights_only=True)
+            target_codec = torch.load(codec_path, weights_only=True)
         
         # Validate tensor shapes
         assert phoneme_ids.dim() == 1, f"phoneme_ids should be 1D, got {phoneme_ids.shape}"
@@ -260,21 +333,23 @@ class PreprocessedTTSDataset(Dataset):
             f"target_codec should be (T, 6), got {target_codec.shape}"
         assert target_codec.shape[0] > 0, f"target_codec has zero length for {item_name}"
         
-        # Load MFA durations - required when require_mfa=True
+        # Load MFA durations from cache or disk
         durations = None
-        tg_stem = self._item_name_to_textgrid_stem(item_name)
-        if tg_stem in self.textgrid_index:
-            durations = self._load_durations_from_textgrid(
-                self.textgrid_index[tg_stem],
-                num_phonemes=len(phoneme_ids)
-            )
-            assert durations is not None, f"Failed to load durations for {item_name}"
-        elif self.require_mfa:
-            # This shouldn't happen since we filtered in __init__, but be defensive
-            raise RuntimeError(
-                f"MFA durations required but not found for {item_name} (stem={tg_stem}). "
-                f"This indicates a bug in dataset validation."
-            )
+        if self.cache_in_ram and safe_name in self._duration_cache:
+            durations = self._duration_cache[safe_name]
+        else:
+            tg_stem = self._item_name_to_textgrid_stem(item_name)
+            if tg_stem in self.textgrid_index:
+                durations = self._load_durations_from_textgrid(
+                    self.textgrid_index[tg_stem],
+                    num_phonemes=len(phoneme_ids)
+                )
+                assert durations is not None, f"Failed to load durations for {item_name}"
+            elif self.require_mfa:
+                raise RuntimeError(
+                    f"MFA durations required but not found for {item_name} (stem={tg_stem}). "
+                    f"This indicates a bug in dataset validation."
+                )
         
         # Get voice reference from same speaker (different utterance)
         speaker = meta.get('speaker', 'unknown')
@@ -291,9 +366,15 @@ class PreprocessedTTSDataset(Dataset):
         
         ref_meta = self.all_metadata[ref_idx]
         ref_safe_name = self._safe_name(ref_meta['item_name'])
-        ref_codec_path = tensors_dir / f"{ref_safe_name}_codec.pt"
-        assert ref_codec_path.exists(), f"Reference codec not found: {ref_codec_path}"
-        voice_codec = torch.load(ref_codec_path, weights_only=True)
+        
+        # Load reference codec from cache or disk
+        if self.cache_in_ram and ref_safe_name in self._codec_cache:
+            voice_codec = self._codec_cache[ref_safe_name]
+        else:
+            tensors_dir = self.processed_dir / "tensors"
+            ref_codec_path = tensors_dir / f"{ref_safe_name}_codec.pt"
+            assert ref_codec_path.exists(), f"Reference codec not found: {ref_codec_path}"
+            voice_codec = torch.load(ref_codec_path, weights_only=True)
         
         assert voice_codec.dim() == 2 and voice_codec.shape[1] == 6, \
             f"voice_codec should be (T, 6), got {voice_codec.shape}"
